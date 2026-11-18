@@ -1,0 +1,19 @@
+syntax: glob
+
+# Python virtual environments & bytecode
+.venv/
+*/.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Live simulation ephemeral logs
+*.log
+Python Playground/playground/data/simulation_logs/*.parquet
+
