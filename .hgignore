@@ -17,3 +17,8 @@ Thumbs.db
 *.log
 Python Playground/playground/data/simulation_logs/*.parquet
 
+# Research dossiers and confidential corporate/legal documents
+research_dossiers/
+research_dossiers/*
+docs/
+docs/*

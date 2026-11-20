@@ -12,7 +12,7 @@ class TakerSignal:
     stop_loss_px: float
     take_profit_px: float
 
-class AggressiveTakerMomentum:
+class AggressiveTM:
     def __init__(
         self,
         volume_spike_threshold_sigma: float = 3.5,
@@ -73,10 +73,13 @@ class AggressiveTakerMomentum:
             timestamp_ms=timestamp_ms,
             symbol=symbol,
             direction=direction,
-            confidence=confidence,
+            confidence=confidence, 
             trigger_type=trigger,
             entry_price=curr_price,
             stop_loss_px=stop_px,
             take_profit_px=tp_px
         )
+
+AggressiveTakerMomentum = AggressiveTM
+
 

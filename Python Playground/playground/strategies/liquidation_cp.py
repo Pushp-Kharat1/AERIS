@@ -14,7 +14,7 @@ class LiquidationWickSignal:
     time_limit_sec: int
     oi_drop_pct: float
 
-class LiquidationCounterPunch:
+class LiquidationCP:
     def __init__(
         self,
         cascade_drop_bps: float = 180.0,
@@ -110,3 +110,7 @@ class LiquidationCounterPunch:
             )
 
         return LiquidationWickSignal(timestamp_ms, symbol, 0, 0.0, "NO_SIGNAL", close_px, 0.0, 0.0, 0, oi_delta_pct)
+
+LiquidationCounterPunch = LiquidationCP
+
+
