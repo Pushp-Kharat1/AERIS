@@ -319,15 +319,17 @@ def test_l3_position_dedup():
 # LAYER 4: REGIME BOUNDARY THRASHING & SIGNAL CONFLICT
 # ==============================================================================
 
-@harness.test("L4.01: MPM - High Frequency Boundary Thrashing (3.49% <-> 3.51%)")
+@harness.test("L4.01: MPM - Schmitt Trigger / Hysteresis eliminates boundary thrashing")
 def test_l4_mpm_boundary_thrashing():
-    alloc = MetaAllocator(max_allowed_leverage=2.5)
+    alloc = MetaAllocator(max_allowed_leverage=2.5, enable_hysteresis=True)
     regimes = []
     for i in range(100):
         vol = 3.499 if (i % 2 == 0) else 3.501
         w = alloc.compute_weights(realized_vol_1h_pct=vol, bid_ask_spread_bps=1.0, liquidation_spike_ratio=1.0)
         regimes.append(w.regime)
-    assert len(set(regimes)) == 2
+    transitions = sum(1 for i in range(1, len(regimes)) if regimes[i] != regimes[i-1])
+    assert transitions <= 2
+    assert regimes[-1] == MarketRegime.VOLATILITY_EXPANSION
 
 
 @harness.test("L4.02: MPM - Fully Contradictory Market Signals")
