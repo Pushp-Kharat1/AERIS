@@ -11,9 +11,13 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# Live simulation ephemeral logs
+# Live simulation ephemeral logs and databases
 *.log
+*.db
+*.sqlite
+*.sqlite3
 Python Playground/playground/data/simulation_logs/*.parquet
+Python Playground/playground/data/daemon_logs/*.parquet
 
 # Research dossiers and confidential corporate/legal documents
 research_dossiers/
