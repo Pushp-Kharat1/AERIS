@@ -115,4 +115,4 @@ python backtest/chaos_engine.py
 
 ## License
 
-Proprietary research and software. All rights reserved.
+Proprietary research and software. All rights reserved. MPL 2.0
