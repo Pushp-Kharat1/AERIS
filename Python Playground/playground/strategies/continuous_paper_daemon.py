@@ -91,60 +91,84 @@ class ContinuousPaperDaemon:
 
         self._init_db()
 
+    def _execute_init_schema(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            with conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS daemon_state (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL
+                    )
+                """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS telemetry_ticks (
+                        timestamp_ms INTEGER PRIMARY KEY,
+                        equity REAL,
+                        cash REAL,
+                        deployed REAL,
+                        leverage REAL,
+                        regime TEXT,
+                        vpin REAL,
+                        net_pnl REAL
+                    )
+                """)
+        finally:
+            conn.close()
+
     def _init_db(self):
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS daemon_state (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                )
-            """)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS telemetry_ticks (
-                    timestamp_ms INTEGER PRIMARY KEY,
-                    equity REAL,
-                    cash REAL,
-                    deployed REAL,
-                    leverage REAL,
-                    regime TEXT,
-                    vpin REAL,
-                    net_pnl REAL
-                )
-            """)
-            conn.commit()
+        try:
+            self._execute_init_schema()
+        except sqlite3.DatabaseError:
+            corrupt_backup = self.db_path.with_name(f"{self.db_path.name}.corrupt.{int(time.time()*1000)}")
+            try:
+                if self.db_path.exists():
+                    self.db_path.rename(corrupt_backup)
+            except Exception:
+                pass
+            self._execute_init_schema()
 
     def persist_state(self):
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            state = {
-                "total_equity": self.total_equity,
-                "cash_usd": self.cash_usd,
-                "total_fees_paid": self.total_fees_paid,
-                "total_tds_paid": self.total_tds_paid,
-                "accrued_funding_total": self.accrued_funding_total,
-                "positions": {k: asdict(v) for k, v in self.active_positions.items()}
-            }
-            cursor.execute("INSERT OR REPLACE INTO daemon_state (key, value) VALUES ('live_state', ?)", (json.dumps(state),))
-            conn.commit()
+        conn = sqlite3.connect(self.db_path)
+        try:
+            with conn:
+                cursor = conn.cursor()
+                state = {
+                    "total_equity": self.total_equity,
+                    "cash_usd": self.cash_usd,
+                    "total_fees_paid": self.total_fees_paid,
+                    "total_tds_paid": self.total_tds_paid,
+                    "accrued_funding_total": self.accrued_funding_total,
+                    "positions": {k: asdict(v) for k, v in self.active_positions.items()}
+                }
+                cursor.execute("INSERT OR REPLACE INTO daemon_state (key, value) VALUES ('live_state', ?)", (json.dumps(state),))
+        finally:
+            conn.close()
 
     def recover_state(self) -> bool:
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT value FROM daemon_state WHERE key = 'live_state'")
-            row = cursor.fetchone()
-            if row:
-                state = json.loads(row[0])
-                self.total_equity = state["total_equity"]
-                self.cash_usd = state["cash_usd"]
-                self.total_fees_paid = state["total_fees_paid"]
-                self.total_tds_paid = state["total_tds_paid"]
-                self.accrued_funding_total = state["accrued_funding_total"]
-                self.active_positions = {
-                    k: DaemonPosition(**v) for k, v in state.get("positions", {}).items()
-                }
-                return True
-        return False
+        try:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                cursor = conn.cursor()
+                cursor.execute("SELECT value FROM daemon_state WHERE key = 'live_state'")
+                row = cursor.fetchone()
+                if row:
+                    state = json.loads(row[0])
+                    self.total_equity = state["total_equity"]
+                    self.cash_usd = state["cash_usd"]
+                    self.total_fees_paid = state["total_fees_paid"]
+                    self.total_tds_paid = state["total_tds_paid"]
+                    self.accrued_funding_total = state["accrued_funding_total"]
+                    self.active_positions = {
+                        k: DaemonPosition(**v) for k, v in state.get("positions", {}).items()
+                    }
+                    return True
+                return False
+            finally:
+                conn.close()
+        except (sqlite3.Error, json.JSONDecodeError, Exception):
+            return False
 
     async def fetch_market_state(self, binance, bybit):
         btc_candles = await binance.fetch_ohlcv("BTC/USDT", timeframe="1h", limit=5)
@@ -302,13 +326,16 @@ class ContinuousPaperDaemon:
         )
         self.telemetry_history.append(telem)
 
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT OR REPLACE INTO telemetry_ticks VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (now_ms, self.total_equity, self.cash_usd, deployed, leverage, weights.regime.name, vpin_val, net_pnl)
-            )
-            conn.commit()
+        conn = sqlite3.connect(self.db_path)
+        try:
+            with conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "INSERT OR REPLACE INTO telemetry_ticks VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (now_ms, self.total_equity, self.cash_usd, deployed, leverage, weights.regime.name, vpin_val, net_pnl)
+                )
+        finally:
+            conn.close()
 
         self.persist_state()
         return telem
