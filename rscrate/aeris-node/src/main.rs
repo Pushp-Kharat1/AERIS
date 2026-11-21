@@ -10,7 +10,8 @@ use aeris_risk::{
     AccountRiskState, MetaLabelGate, MetaLabelGateConfig, OrphanedLegTracker, PreTradeRiskGateway,
     RiskGatewayConfig,
 };
-use std::collections::HashMap;
+use aeris_strategy::{CrossVenueArbEngine, CrossVenueOpportunity, MicroMomentumEngine};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -32,6 +33,10 @@ pub struct AerisEngineNode {
     pub orphaned_tracker: OrphanedLegTracker,
     pub deadman: DeadManSnitch,
     pub books: HashMap<(Venue, Symbol), L2OrderBook>,
+    pub arb_engine: CrossVenueArbEngine,
+    pub momentum_engine: MicroMomentumEngine,
+    pub last_cross_venue_opp: Option<CrossVenueOpportunity>,
+    pub total_spreads_executed: u64,
     pub shm: Option<PingPongSharedMemory>,
     pub last_macro_seq: u64,
     pub active_macro: MacroPayload,
@@ -53,6 +58,15 @@ impl AerisEngineNode {
         let friction = FrictionModel::default();
         let router = ExecutionRouter::new(risk_gateway.clone(), friction);
 
+        let arb_engine = CrossVenueArbEngine::new(
+            Fixed8::from_f64(2.0), // 2.0 bps minimum net profit hurdle after fees + TDS
+            Fixed8::from_f64(50_000.0), // $50,000 max single leg notional
+        );
+        let momentum_engine = MicroMomentumEngine::new(
+            Fixed8::from_f64(0.5), // 0.5 bps divergence threshold
+            Fixed8::from_f64(0.1), // 0.1 BTC order size
+        );
+
         let shm = shm_path.and_then(|p| PingPongSharedMemory::create_or_open(p).ok());
 
         Self {
@@ -66,6 +80,10 @@ impl AerisEngineNode {
             orphaned_tracker: OrphanedLegTracker::new(50), // 50ms timeout
             deadman: DeadManSnitch::new(3000),             // 3s timeout
             books: HashMap::new(),
+            arb_engine,
+            momentum_engine,
+            last_cross_venue_opp: None,
+            total_spreads_executed: 0,
             shm,
             last_macro_seq: 0,
             active_macro: MacroPayload::default(),
@@ -106,6 +124,7 @@ impl AerisEngineNode {
 
         let mut executed_intents = Vec::new();
 
+        // 1. Orphaned-Leg 50ms Timeout Check
         let unwinds = self.orphaned_tracker.check_timeouts(now_ns);
         for unwind in unwinds {
             println!(
@@ -113,6 +132,60 @@ impl AerisEngineNode {
                 unwind.parent_leg_id.unwrap_or(0)
             );
             executed_intents.push(unwind);
+        }
+
+        // 2. Cross-Venue Net Spread Arbitrage Scanner
+        let unique_symbols: HashSet<Symbol> = self.books.keys().map(|(_, sym)| *sym).collect();
+        for sym in unique_symbols {
+            let binance_book = self.books.get(&(Venue::Binance, sym));
+            let bybit_book = self.books.get(&(Venue::Bybit, sym));
+
+            if let (Some(b_book), Some(by_book)) = (binance_book, bybit_book) {
+                if let Some(opp) = self.arb_engine.inspect_spread(sym, b_book, by_book) {
+                    self.last_cross_venue_opp = Some(opp.clone());
+
+                    if let Some(spread) = self.arb_engine.generate_spread_intent(&opp, now_ns) {
+                        println!(
+                            "  [STRATEGY] 🔥 ARB OPPORTUNITY: Buy {:?} @ ${:.2} | Sell {:?} @ ${:.2} | Gross: {:+.2} bps | Net: {:+.2} bps | Qty: {}",
+                            opp.buy_venue,
+                            opp.buy_price.to_f64(),
+                            opp.sell_venue,
+                            opp.sell_price.to_f64(),
+                            opp.gross_spread_bps.to_f64(),
+                            opp.net_spread_bps.to_f64(),
+                            opp.max_qty.to_f64()
+                        );
+
+                        let risk_a = self.risk_gateway.evaluate_order(&spread.leg_a_buy, &self.account, Some(opp.buy_price));
+                        let risk_b = self.risk_gateway.evaluate_order(&spread.leg_b_sell, &self.account, Some(opp.sell_price));
+
+                        if risk_a.is_ok() && risk_b.is_ok() {
+                            self.orphaned_tracker.register_spread(
+                                spread.spread_id,
+                                spread.leg_a_buy,
+                                spread.leg_b_sell,
+                            );
+
+                            let _ = self.router.validate_and_route(&spread.leg_a_buy, &self.account, Some(opp.buy_price));
+                            let _ = self.router.validate_and_route(&spread.leg_b_sell, &self.account, Some(opp.sell_price));
+
+                            self.total_spreads_executed += 1;
+                            executed_intents.push(spread.leg_a_buy);
+                            executed_intents.push(spread.leg_b_sell);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Stoikov Micro-Divergence Momentum Scanner
+        for ((_, _), book) in &self.books {
+            if let Some(intent) = self.momentum_engine.evaluate_signal(book, self.active_macro.macro_bias, now_ns) {
+                if self.risk_gateway.evaluate_order(&intent, &self.account, Some(intent.price)).is_ok() {
+                    let _ = self.router.validate_and_route(&intent, &self.account, Some(intent.price));
+                    executed_intents.push(intent);
+                }
+            }
         }
 
         executed_intents
@@ -134,15 +207,29 @@ impl AerisEngineNode {
             leverage.to_f64()
         );
         println!(
-            " Macro Bias: {} | IPC Seq: {} | Universe Count: {}",
+            " Macro Bias: {} | IPC Seq: {} | Universe Count: {} | Total Spreads Executed: {}",
             match self.active_macro.macro_bias {
                 1 => "SUPPLY_SQUEEZE (Bullish)",
                 2 => "DISTRIBUTION (Bearish)",
                 _ => "NEUTRAL / QUIET",
             },
             self.last_macro_seq,
-            self.active_macro.universe_len
+            self.active_macro.universe_len,
+            self.total_spreads_executed
         );
+
+        if let Some(ref opp) = self.last_cross_venue_opp {
+            println!(
+                "   [ARB SPREAD] {} Buy {:?} (${:.2}) -> Sell {:?} (${:.2}) | Gross: {:+.2} bps | Net: {:+.2} bps",
+                opp.symbol.as_str(),
+                opp.buy_venue,
+                opp.buy_price.to_f64(),
+                opp.sell_venue,
+                opp.sell_price.to_f64(),
+                opp.gross_spread_bps.to_f64(),
+                opp.net_spread_bps.to_f64()
+            );
+        }
 
         for ((venue, sym), book) in &self.books {
             let bbo_bid = book.best_bid().map(|b| b.price.to_f64()).unwrap_or(0.0);
@@ -222,6 +309,7 @@ async fn main() {
 
         while running.load(Ordering::SeqCst) {
             tokio::select! {
+                biased;
                 Some(update) = rx.recv() => {
                     node.on_book_update(&update);
                     println!(
@@ -283,6 +371,24 @@ async fn main() {
                 is_snapshot: true,
             };
             node.on_book_update(&btc_update);
+
+            let bybit_btc_ask = btc_bid + 2.0;
+            let bybit_btc_bid = btc_bid - 3.0;
+            let bybit_btc_update = BookUpdate {
+                venue: Venue::Bybit,
+                symbol: btc_sym,
+                timestamp_ns: current_time_ns(),
+                bids: vec![BookLevel {
+                    price: Fixed8::from_f64(bybit_btc_bid),
+                    qty: Fixed8::from_f64(8.0),
+                }],
+                asks: vec![BookLevel {
+                    price: Fixed8::from_f64(bybit_btc_ask),
+                    qty: Fixed8::from_f64(10.0),
+                }],
+                is_snapshot: true,
+            };
+            node.on_book_update(&bybit_btc_update);
 
             let avax_bid = 30.0 + (tick_counter as f64 * 0.02);
             let avax_update = BookUpdate {
