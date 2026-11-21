@@ -6,6 +6,7 @@ members = [
     "aeris-feed",
     "aeris-execution",
     "aeris-ipc",
+    "aeris-node",
 ]
 
 [workspace.package]

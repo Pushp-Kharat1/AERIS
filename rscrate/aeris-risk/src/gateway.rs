@@ -47,6 +47,7 @@ pub struct AccountRiskState {
     pub total_deployed_notional: Fixed8,
 }
 
+#[derive(Clone, Debug)]
 pub struct PreTradeRiskGateway {
     config: RiskGatewayConfig,
 }
