@@ -1,0 +1,12 @@
+[package]
+name = "aeris-execution"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+aeris-core = { path = "../aeris-core" }
+aeris-risk = { path = "../aeris-risk" }
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "1.0"

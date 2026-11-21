@@ -1,3 +1,8 @@
+# Rust compilation target directories
+target/
+**/target/
+*.rs.bk
+
 # Python virtual environments & bytecode
 .venv/
 */.venv/
