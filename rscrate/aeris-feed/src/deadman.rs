@@ -18,6 +18,13 @@ impl DeadManSnitch {
         self.last_heartbeat_ns.insert(venue, timestamp_ns);
     }
 
+    pub fn is_venue_stalled(&self, venue: Venue, current_time_ns: TimestampNs) -> bool {
+        match self.last_heartbeat_ns.get(&venue) {
+            Some(&last_ts) => current_time_ns.saturating_sub(last_ts) >= self.timeout_ns,
+            None => true,
+        }
+    }
+
     pub fn check_stalled_venues(&self, current_time_ns: TimestampNs) -> Vec<Venue> {
         let mut stalled = Vec::new();
         for (&venue, &last_ts) in &self.last_heartbeat_ns {

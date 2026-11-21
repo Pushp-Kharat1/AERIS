@@ -2,7 +2,9 @@ use aeris_core::{
     BookLevel, BookUpdate, Fixed8, OrderIntent, Symbol, TimestampNs, Venue,
 };
 use aeris_execution::{ExecutionRouter, FrictionModel};
-use aeris_feed::{DeadManSnitch, L2OrderBook};
+use aeris_feed::{
+    connect_binance_depth, connect_bybit_depth, DeadManSnitch, L2OrderBook,
+};
 use aeris_ipc::{MacroPayload, PingPongSharedMemory};
 use aeris_risk::{
     AccountRiskState, MetaLabelGate, MetaLabelGateConfig, OrphanedLegTracker, PreTradeRiskGateway,
@@ -13,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
 
 fn current_time_ns() -> TimestampNs {
     SystemTime::now()
@@ -28,7 +31,7 @@ pub struct AerisEngineNode {
     pub router: ExecutionRouter,
     pub orphaned_tracker: OrphanedLegTracker,
     pub deadman: DeadManSnitch,
-    pub books: HashMap<Symbol, L2OrderBook>,
+    pub books: HashMap<(Venue, Symbol), L2OrderBook>,
     pub shm: Option<PingPongSharedMemory>,
     pub last_macro_seq: u64,
     pub active_macro: MacroPayload,
@@ -90,7 +93,7 @@ impl AerisEngineNode {
 
         let book = self
             .books
-            .entry(update.symbol)
+            .entry((update.venue, update.symbol))
             .or_insert_with(|| L2OrderBook::new(update.venue, update.symbol));
         book.apply_update(update);
     }
@@ -141,7 +144,7 @@ impl AerisEngineNode {
             self.active_macro.universe_len
         );
 
-        for (sym, book) in &self.books {
+        for ((venue, sym), book) in &self.books {
             let bbo_bid = book.best_bid().map(|b| b.price.to_f64()).unwrap_or(0.0);
             let bbo_ask = book.best_ask().map(|a| a.price.to_f64()).unwrap_or(0.0);
             let mid = book.mid_price().map(|m| m.to_f64()).unwrap_or(0.0);
@@ -152,7 +155,8 @@ impl AerisEngineNode {
                 .unwrap_or(0.0);
 
             println!(
-                "   [{}] Bid: ${:.2} | Ask: ${:.2} | Mid: ${:.2} | Micro: ${:.2} (Div: {:+.2} bps)",
+                "   [{:?} {}] Bid: ${:.2} | Ask: ${:.2} | Mid: ${:.2} | Micro: ${:.2} (Div: {:+.2} bps)",
+                venue,
                 sym.as_str(),
                 bbo_bid,
                 bbo_ask,
@@ -171,80 +175,138 @@ async fn main() {
     println!("             AERIS PRODUCTION ENGINE NODE (ARMORED RUST RUNTIME)                ");
     println!("================================================================================\n");
 
+    let args: Vec<String> = std::env::args().collect();
+    let is_live = args.iter().any(|a| a == "--live");
+    let max_ticks: Option<u64> = args
+        .iter()
+        .position(|a| a == "--ticks")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse::<u64>().ok());
+
     let shm_path = PathBuf::from(
         "D:/Pushp - Do not open without permission/AERIS/Python Playground/data/aeris_shm.dat",
     );
     let mut node = AerisEngineNode::new(Fixed8::from_f64(100_000.0), Some(shm_path));
-
-    let btc_sym = Symbol::from_str_truncate("BTCUSDT");
-    let avax_sym = Symbol::from_str_truncate("AVAXUSDT");
 
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
 
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
+        println!("\n[INFO] Shutdown signal received. Stopping Aeris Engine Node...");
         r.store(false, Ordering::SeqCst);
     });
 
-    println!("[INFO] Initialized node with $100,000.00 equity. Starting tick loop...");
+    if is_live {
+        println!("[INFO] Initialized node with $100,000.00 equity in LIVE STREAMING mode.");
+        let (tx, mut rx) = mpsc::channel::<BookUpdate>(1024);
 
-    let mut tick_counter: u64 = 0;
+        let tx_binance = tx.clone();
+        tokio::spawn(async move {
+            println!("[FEED] Spawning Binance WebSocket feed handler for BTCUSDT...");
+            if let Err(e) = connect_binance_depth("BTCUSDT", tx_binance).await {
+                eprintln!("[WARN] Binance WS terminated: {:?}", e);
+            }
+        });
 
-    while running.load(Ordering::SeqCst) && tick_counter < 5 {
-        tick_counter += 1;
+        let tx_bybit = tx.clone();
+        tokio::spawn(async move {
+            println!("[FEED] Spawning Bybit WebSocket feed handler for BTCUSDT...");
+            if let Err(e) = connect_bybit_depth("BTCUSDT", tx_bybit).await {
+                eprintln!("[WARN] Bybit WS terminated: {:?}", e);
+            }
+        });
 
-        let btc_bid = 60_000.0 + (tick_counter as f64 * 0.5);
-        let btc_update = BookUpdate {
-            venue: Venue::Binance,
-            symbol: btc_sym,
-            timestamp_ns: current_time_ns(),
-            bids: vec![
-                BookLevel {
-                    price: Fixed8::from_f64(btc_bid),
-                    qty: Fixed8::from_f64(12.5),
-                },
-                BookLevel {
-                    price: Fixed8::from_f64(btc_bid - 5.0),
-                    qty: Fixed8::from_f64(20.0),
-                },
-            ],
-            asks: vec![
-                BookLevel {
-                    price: Fixed8::from_f64(btc_bid + 5.0),
-                    qty: Fixed8::from_f64(2.0),
-                },
-                BookLevel {
-                    price: Fixed8::from_f64(btc_bid + 10.0),
-                    qty: Fixed8::from_f64(5.0),
-                },
-            ],
-            is_snapshot: true,
-        };
-        node.on_book_update(&btc_update);
+        let mut interval = tokio::time::interval(Duration::from_millis(500));
+        let mut ticks: u64 = 0;
 
-        let avax_bid = 30.0 + (tick_counter as f64 * 0.02);
-        let avax_update = BookUpdate {
-            venue: Venue::Bybit,
-            symbol: avax_sym,
-            timestamp_ns: current_time_ns(),
-            bids: vec![BookLevel {
-                price: Fixed8::from_f64(avax_bid),
-                qty: Fixed8::from_f64(500.0),
-            }],
-            asks: vec![BookLevel {
-                price: Fixed8::from_f64(avax_bid + 0.05),
-                qty: Fixed8::from_f64(150.0),
-            }],
-            is_snapshot: true,
-        };
-        node.on_book_update(&avax_update);
+        while running.load(Ordering::SeqCst) {
+            tokio::select! {
+                Some(update) = rx.recv() => {
+                    node.on_book_update(&update);
+                    println!(
+                        "  -> [LIVE FEED] {:?} {} | Best Bid: ${:.2} | Best Ask: ${:.2}",
+                        update.venue,
+                        update.symbol.as_str(),
+                        update.bids.first().map(|b| b.price.to_f64()).unwrap_or(0.0),
+                        update.asks.first().map(|a| a.price.to_f64()).unwrap_or(0.0)
+                    );
+                }
+                _ = interval.tick() => {
+                    node.execute_cycle();
+                    node.print_status();
+                    ticks += 1;
+                    if let Some(limit) = max_ticks {
+                        if ticks >= limit {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        println!("[INFO] Initialized node with $100,000.00 equity in SIMULATION mode.");
+        let btc_sym = Symbol::from_str_truncate("BTCUSDT");
+        let avax_sym = Symbol::from_str_truncate("AVAXUSDT");
 
-        node.execute_cycle();
-        node.print_status();
+        let mut tick_counter: u64 = 0;
+        let limit = max_ticks.unwrap_or(5);
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        while running.load(Ordering::SeqCst) && tick_counter < limit {
+            tick_counter += 1;
+
+            let btc_bid = 60_000.0 + (tick_counter as f64 * 0.5);
+            let btc_update = BookUpdate {
+                venue: Venue::Binance,
+                symbol: btc_sym,
+                timestamp_ns: current_time_ns(),
+                bids: vec![
+                    BookLevel {
+                        price: Fixed8::from_f64(btc_bid),
+                        qty: Fixed8::from_f64(12.5),
+                    },
+                    BookLevel {
+                        price: Fixed8::from_f64(btc_bid - 5.0),
+                        qty: Fixed8::from_f64(20.0),
+                    },
+                ],
+                asks: vec![
+                    BookLevel {
+                        price: Fixed8::from_f64(btc_bid + 5.0),
+                        qty: Fixed8::from_f64(2.0),
+                    },
+                    BookLevel {
+                        price: Fixed8::from_f64(btc_bid + 10.0),
+                        qty: Fixed8::from_f64(5.0),
+                    },
+                ],
+                is_snapshot: true,
+            };
+            node.on_book_update(&btc_update);
+
+            let avax_bid = 30.0 + (tick_counter as f64 * 0.02);
+            let avax_update = BookUpdate {
+                venue: Venue::Bybit,
+                symbol: avax_sym,
+                timestamp_ns: current_time_ns(),
+                bids: vec![BookLevel {
+                    price: Fixed8::from_f64(avax_bid),
+                    qty: Fixed8::from_f64(500.0),
+                }],
+                asks: vec![BookLevel {
+                    price: Fixed8::from_f64(avax_bid + 0.05),
+                    qty: Fixed8::from_f64(150.0),
+                }],
+                is_snapshot: true,
+            };
+            node.on_book_update(&avax_update);
+
+            node.execute_cycle();
+            node.print_status();
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
     }
 
-    println!("[INFO] Node simulation completed successfully.");
+    println!("[INFO] Node execution completed cleanly.");
 }

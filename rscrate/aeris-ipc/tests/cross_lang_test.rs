@@ -4,7 +4,16 @@ use std::path::PathBuf;
 
 #[test]
 fn test_rust_reading_python_shared_memory() {
+    let python_exe = PathBuf::from("D:/Pushp - Do not open without permission/AERIS/Python Playground/.venv/Scripts/python.exe");
+    let bridge_py = PathBuf::from("D:/Pushp - Do not open without permission/AERIS/Python Playground/ipc_bridge.py");
     let shm_path = PathBuf::from("D:/Pushp - Do not open without permission/AERIS/Python Playground/data/aeris_shm.dat");
+
+    if python_exe.exists() && bridge_py.exists() {
+        let _ = std::process::Command::new(&python_exe)
+            .arg(&bridge_py)
+            .status();
+    }
+
     if !shm_path.exists() {
         return;
     }

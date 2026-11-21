@@ -97,3 +97,14 @@ class SharedMemoryBridgePy:
     def close(self):
         self.mm.close()
         self.file_obj.close()
+
+
+if __name__ == "__main__":
+    bridge = SharedMemoryBridgePy()
+    seq = bridge.stage_and_flip(
+        macro_bias=1,
+        leverage_cap=2.0,
+        universe=["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+    )
+    print(f"Staged and flipped shared memory sequence: {seq}")
+    bridge.close()

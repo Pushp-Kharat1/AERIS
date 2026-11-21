@@ -1,8 +1,16 @@
+pub mod binance_ws;
+pub mod bybit_ws;
 pub mod deadman;
 pub mod orderbook;
 
+pub use binance_ws::*;
+pub use bybit_ws::*;
 pub use deadman::*;
 pub use orderbook::*;
+
+pub fn init_crypto_provider() {
+    rustls::crypto::ring::default_provider().install_default().ok();
+}
 
 #[cfg(test)]
 mod tests {
@@ -71,5 +79,40 @@ mod tests {
 
         let divergence = book.micro_price_divergence_bps().unwrap();
         assert!(divergence.to_f64() > 0.0);
+    }
+
+    #[test]
+    fn test_binance_depth_parser() {
+        let sym = Symbol::from_str_truncate("BTCUSDT");
+        let sample = r#"{
+            "E": 1795020786580,
+            "bids": [["60000.50", "1.500"], ["59990.00", "5.000"]],
+            "asks": [["60010.50", "2.000"]]
+        }"#;
+
+        let update = parse_binance_depth(sample, sym).unwrap();
+        assert_eq!(update.venue, Venue::Binance);
+        assert_eq!(update.bids.len(), 2);
+        assert_eq!(update.bids[0].price.to_f64(), 60000.50);
+        assert_eq!(update.asks[0].price.to_f64(), 60010.50);
+    }
+
+    #[test]
+    fn test_bybit_depth_parser() {
+        let sym = Symbol::from_str_truncate("BTCUSDT");
+        let sample = r#"{
+            "topic": "orderbook.50.BTCUSDT",
+            "type": "snapshot",
+            "ts": 1795020786580,
+            "data": {
+                "b": [["60002.00", "0.800"]],
+                "a": [["60005.00", "1.200"]]
+            }
+        }"#;
+
+        let update = parse_bybit_depth(sample, sym).unwrap().unwrap();
+        assert_eq!(update.venue, Venue::Bybit);
+        assert!(update.is_snapshot);
+        assert_eq!(update.bids[0].price.to_f64(), 60002.00);
     }
 }

@@ -30,7 +30,11 @@ impl Fixed8 {
 
     #[inline(always)]
     pub fn from_f64(v: f64) -> Self {
-        Self((v * SCALE as f64).round() as i64)
+        if v.is_nan() || v.is_infinite() {
+            Self::ZERO
+        } else {
+            Self((v * SCALE as f64).round() as i64)
+        }
     }
 
     #[inline(always)]

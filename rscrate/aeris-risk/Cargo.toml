@@ -9,3 +9,7 @@ license.workspace = true
 aeris-core = { path = "../aeris-core" }
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "1.0"
+
+[dev-dependencies]
+aeris-feed = { path = "../aeris-feed" }
+aeris-execution = { path = "../aeris-execution" }

@@ -20,6 +20,9 @@ pub enum RiskRejection {
     #[error("Account has zero or negative equity {equity}")]
     InsolventAccount { equity: Fixed8 },
 
+    #[error("Order has non-positive price {price} or quantity {qty}")]
+    InvalidOrderDimensions { price: Fixed8, qty: Fixed8 },
+
     #[error("Meta-label win probability {probability} is below threshold hurdle {min_hurdle}")]
     MetaLabelHurdleFailed { probability: Fixed8, min_hurdle: Fixed8 },
 }
@@ -66,6 +69,13 @@ impl PreTradeRiskGateway {
         if account.total_equity <= Fixed8::ZERO {
             return Err(RiskRejection::InsolventAccount {
                 equity: account.total_equity,
+            });
+        }
+
+        if intent.price <= Fixed8::ZERO || intent.qty <= Fixed8::ZERO {
+            return Err(RiskRejection::InvalidOrderDimensions {
+                price: intent.price,
+                qty: intent.qty,
             });
         }
 
