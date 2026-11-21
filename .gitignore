@@ -16,8 +16,8 @@ Thumbs.db
 *.db
 *.sqlite
 *.sqlite3
-Python Playground/playground/data/simulation_logs/*.parquet
-Python Playground/playground/data/daemon_logs/*.parquet
+**/simulation_logs/*.parquet
+**/daemon_logs/*.parquet
 
 # Research dossiers and confidential corporate/legal documents
 research_dossiers/
