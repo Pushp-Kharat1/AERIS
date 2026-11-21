@@ -1,7 +1,9 @@
 pub mod gateway;
+pub mod meta_label;
 pub mod orphaned_leg;
 
 pub use gateway::*;
+pub use meta_label::*;
 pub use orphaned_leg::*;
 
 #[cfg(test)]
@@ -79,5 +81,30 @@ mod tests {
         assert_eq!(emergency.side, Side::Sell);
         assert_eq!(emergency.order_type, OrderType::ImmediateOrCancel);
         assert_eq!(emergency.qty, Fixed8::from_f64(100.0));
+    }
+
+    #[test]
+    fn test_meta_label_gate_and_kelly_sizing() {
+        let gate = MetaLabelGate::new(MetaLabelGateConfig::default());
+        let intent = OrderIntent {
+            client_order_id: 1,
+            venue: Venue::Binance,
+            symbol: Symbol::from_str_truncate("BTCUSDT"),
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GoodTilCancelled,
+            price: Fixed8::from_f64(60_000.0),
+            qty: Fixed8::from_f64(1.0),
+            created_at_ns: 1000,
+            parent_leg_id: None,
+        };
+
+        // Below 60% hurdle -> rejected
+        let rejected = gate.evaluate_and_size(&intent, Fixed8::from_f64(0.55));
+        assert!(matches!(rejected, Err(RiskRejection::MetaLabelHurdleFailed { .. })));
+
+        // 80% confidence -> Kelly = 2(0.8) - 1 = 0.60 -> sized qty = 0.60
+        let sized = gate.evaluate_and_size(&intent, Fixed8::from_f64(0.80)).unwrap();
+        assert_eq!(sized.qty.to_f64(), 0.60);
     }
 }

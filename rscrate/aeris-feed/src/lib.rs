@@ -41,4 +41,35 @@ mod tests {
         // 10 / 60000 * 10000 = 1.6666 bps
         assert!((spread.to_f64() - 1.66666).abs() < 0.01);
     }
+
+    #[test]
+    fn test_micro_price_calculation() {
+        let sym = Symbol::from_str_truncate("BTCUSDT");
+        let mut book = L2OrderBook::new(Venue::Binance, sym);
+
+        let update = BookUpdate {
+            venue: Venue::Binance,
+            symbol: sym,
+            timestamp_ns: 1000,
+            bids: vec![
+                BookLevel { price: Fixed8::from_f64(60000.0), qty: Fixed8::from_f64(9.0) }, // Heavy bid
+            ],
+            asks: vec![
+                BookLevel { price: Fixed8::from_f64(60010.0), qty: Fixed8::from_f64(1.0) }, // Thin ask
+            ],
+            is_snapshot: true,
+        };
+
+        book.apply_update(&update);
+
+        let mid = book.mid_price().unwrap();
+        assert_eq!(mid.to_f64(), 60005.0);
+
+        let micro = book.micro_price().unwrap();
+        // (9 * 60010 + 1 * 60000) / 10 = 60009.0
+        assert_eq!(micro.to_f64(), 60009.0);
+
+        let divergence = book.micro_price_divergence_bps().unwrap();
+        assert!(divergence.to_f64() > 0.0);
+    }
 }

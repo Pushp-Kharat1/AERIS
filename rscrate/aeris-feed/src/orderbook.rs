@@ -84,6 +84,33 @@ impl L2OrderBook {
         Some(bps)
     }
 
+    pub fn mid_price(&self) -> Option<Fixed8> {
+        let bid = self.best_bid()?;
+        let ask = self.best_ask()?;
+        Some((bid.price + ask.price) / Fixed8::from_f64(2.0))
+    }
+
+    pub fn micro_price(&self) -> Option<Fixed8> {
+        let bid = self.best_bid()?;
+        let ask = self.best_ask()?;
+        let total_qty = bid.qty + ask.qty;
+        if total_qty.is_zero() {
+            return self.mid_price();
+        }
+        let weighted = (bid.qty * ask.price) + (ask.qty * bid.price);
+        Some(weighted / total_qty)
+    }
+
+    pub fn micro_price_divergence_bps(&self) -> Option<Fixed8> {
+        let mid = self.mid_price()?;
+        let micro = self.micro_price()?;
+        if mid.is_zero() {
+            return None;
+        }
+        let diff = micro - mid;
+        Some((diff / mid) * Fixed8::from_f64(10000.0))
+    }
+
     pub fn ofi_top(&self, prev: &L2OrderBook) -> Fixed8 {
         let curr_bid = self.best_bid().unwrap_or(BookLevel { price: Fixed8::ZERO, qty: Fixed8::ZERO });
         let prev_bid = prev.best_bid().unwrap_or(BookLevel { price: Fixed8::ZERO, qty: Fixed8::ZERO });

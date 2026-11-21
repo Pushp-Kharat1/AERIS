@@ -21,6 +21,8 @@ Thumbs.db
 *.db
 *.sqlite
 *.sqlite3
+*.dat
+**/data/*.dat
 **/simulation_logs/*.parquet
 **/daemon_logs/*.parquet
 

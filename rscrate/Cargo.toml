@@ -5,6 +5,7 @@ members = [
     "aeris-risk",
     "aeris-feed",
     "aeris-execution",
+    "aeris-ipc",
 ]
 
 [workspace.package]

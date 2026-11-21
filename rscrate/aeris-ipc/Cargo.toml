@@ -1,0 +1,12 @@
+[package]
+name = "aeris-ipc"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+aeris-core = { path = "../aeris-core" }
+memmap2 = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "1.0"

@@ -19,6 +19,9 @@ pub enum RiskRejection {
 
     #[error("Account has zero or negative equity {equity}")]
     InsolventAccount { equity: Fixed8 },
+
+    #[error("Meta-label win probability {probability} is below threshold hurdle {min_hurdle}")]
+    MetaLabelHurdleFailed { probability: Fixed8, min_hurdle: Fixed8 },
 }
 
 #[derive(Clone, Debug)]
