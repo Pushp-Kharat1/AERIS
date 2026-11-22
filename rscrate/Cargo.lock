@@ -41,6 +41,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "aeris-gd"
+version = "0.1.0"
+dependencies = [
+ "aeris-core",
+ "aeris-execution",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "aeris-ipc"
 version = "0.1.0"
 dependencies = [
@@ -57,6 +69,7 @@ dependencies = [
  "aeris-core",
  "aeris-execution",
  "aeris-feed",
+ "aeris-gd",
  "aeris-ipc",
  "aeris-risk",
  "aeris-strategy",

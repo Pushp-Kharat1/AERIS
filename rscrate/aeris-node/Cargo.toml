@@ -11,6 +11,7 @@ aeris-risk = { path = "../aeris-risk" }
 aeris-feed = { path = "../aeris-feed" }
 aeris-execution = { path = "../aeris-execution" }
 aeris-strategy = { path = "../aeris-strategy" }
+aeris-gd = { path = "../aeris-gd" }
 aeris-ipc = { path = "../aeris-ipc" }
 tokio = { version = "1.38", features = ["full"] }
 crossbeam-channel = "0.5"

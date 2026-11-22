@@ -1,0 +1,14 @@
+[package]
+name = "aeris-gd"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+aeris-core = { path = "../aeris-core" }
+aeris-execution = { path = "../aeris-execution" }
+tokio = { version = "1.38", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"

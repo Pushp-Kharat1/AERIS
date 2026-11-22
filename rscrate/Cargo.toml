@@ -8,6 +8,7 @@ members = [
     "aeris-ipc",
     "aeris-strategy",
     "aeris-node",
+    "aeris-gd",
 ]
 
 [workspace.package]

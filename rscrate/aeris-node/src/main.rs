@@ -284,6 +284,41 @@ async fn main() {
         r.store(false, Ordering::SeqCst);
     });
 
+    // Spawn GD (Guardian Daemon) Heartbeat Watchdog Sender
+    let r_gd = running.clone();
+    tokio::spawn(async move {
+        let dest = format!("127.0.0.1:{}", aeris_gd::DEFAULT_GD_PORT);
+        if let Ok(socket) = tokio::net::UdpSocket::bind("127.0.0.1:0").await {
+            let mut seq = 0;
+            while r_gd.load(Ordering::SeqCst) {
+                seq += 1;
+                let packet = aeris_gd::HeartbeatPacket {
+                    seq,
+                    timestamp_ns: current_time_ns(),
+                    active_positions_count: 0,
+                    auth_token: aeris_gd::AUTH_MAGIC_TOKEN,
+                    is_disarm: false,
+                };
+                if let Ok(bytes) = serde_json::to_vec(&packet) {
+                    let _ = socket.send_to(&bytes, &dest).await;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+
+            // Disarm GD cleanly on authorized shutdown
+            let disarm = aeris_gd::HeartbeatPacket {
+                seq: seq + 1,
+                timestamp_ns: current_time_ns(),
+                active_positions_count: 0,
+                auth_token: aeris_gd::AUTH_MAGIC_TOKEN,
+                is_disarm: true,
+            };
+            if let Ok(bytes) = serde_json::to_vec(&disarm) {
+                let _ = socket.send_to(&bytes, &dest).await;
+            }
+        }
+    });
+
     if is_live {
         println!("[INFO] Initialized node with $100,000.00 equity in LIVE STREAMING mode.");
         let (tx, mut rx) = mpsc::channel::<BookUpdate>(1024);
