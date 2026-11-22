@@ -1,6 +1,10 @@
+pub mod breakout;
+pub mod counter_punch;
 pub mod cross_venue;
 pub mod micro_momentum;
 
+pub use breakout::*;
+pub use counter_punch::*;
 pub use cross_venue::*;
 pub use micro_momentum::*;
 

@@ -65,6 +65,14 @@ impl L2OrderBook {
         }
     }
 
+    pub fn bids(&self) -> &[BookLevel] {
+        &self.bids
+    }
+
+    pub fn asks(&self) -> &[BookLevel] {
+        &self.asks
+    }
+
     pub fn best_bid(&self) -> Option<BookLevel> {
         self.bids.first().copied()
     }

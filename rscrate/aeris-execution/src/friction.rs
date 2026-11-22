@@ -18,6 +18,14 @@ impl Default for FrictionModel {
 }
 
 impl FrictionModel {
+    pub fn offshore_linear() -> Self {
+        Self {
+            maker_fee_bps: Fixed8::from_f64(2.0),
+            taker_fee_bps: Fixed8::from_f64(5.0),
+            tds_rate: Fixed8::ZERO,
+        }
+    }
+
     #[inline(always)]
     pub fn compute_fee(&self, notional: Fixed8, is_maker: bool) -> Fixed8 {
         let fee_bps = if is_maker {

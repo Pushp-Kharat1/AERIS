@@ -10,7 +10,10 @@ use aeris_risk::{
     AccountRiskState, MetaLabelGate, MetaLabelGateConfig, OrphanedLegTracker, PreTradeRiskGateway,
     RiskGatewayConfig,
 };
-use aeris_strategy::{CrossVenueArbEngine, CrossVenueOpportunity, MicroMomentumEngine};
+use aeris_strategy::{
+    AggressiveBreakoutEngine, CounterPunchEngine, CrossVenueArbEngine, CrossVenueOpportunity,
+    MicroMomentumEngine,
+};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,8 +28,28 @@ fn current_time_ns() -> TimestampNs {
         .as_nanos() as u64
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum StrategyId {
+    StoikovMicro,
+    AggressiveBreakout,
+    CounterPunch,
+    CrossVenueArb,
+}
+
+impl StrategyId {
+    pub fn name(&self) -> &'static str {
+        match self {
+            StrategyId::StoikovMicro => "StoikovMicro",
+            StrategyId::AggressiveBreakout => "AggressiveBreakout",
+            StrategyId::CounterPunch => "CounterPunch",
+            StrategyId::CrossVenueArb => "CrossVenueArb",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
-pub struct PaperPosition {
+pub struct StrategyPosition {
+    pub strategy: StrategyId,
     pub venue: Venue,
     pub symbol: Symbol,
     pub side: Side,
@@ -34,22 +57,41 @@ pub struct PaperPosition {
     pub avg_entry_price: Fixed8,
     pub total_notional: Fixed8,
     pub entry_time_ns: TimestampNs,
+    pub take_profit_price: Fixed8,
+    pub stop_loss_price: Fixed8,
+    pub entry_cycle: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct StrategyMetrics {
+    pub fills_count: u64,
+    pub closed_trades: u64,
+    pub winning_trades: u64,
+    pub gross_realized_pnl: Fixed8,
+    pub fees_paid: Fixed8,
+    pub tds_paid: Fixed8,
+    pub net_realized_pnl: Fixed8,
 }
 
 pub struct AerisEngineNode {
     pub initial_equity: Fixed8,
     pub account: AccountRiskState,
     pub realized_pnl: Fixed8,
-    pub paper_positions: HashMap<(Venue, Symbol), PaperPosition>,
+    pub paper_positions: HashMap<(StrategyId, Venue, Symbol), StrategyPosition>,
+    pub strategy_metrics: HashMap<StrategyId, StrategyMetrics>,
+    pub recent_mids: HashMap<(Venue, Symbol), Vec<Fixed8>>,
     pub total_fills_count: u64,
     pub risk_gateway: PreTradeRiskGateway,
     pub meta_gate: MetaLabelGate,
+    pub friction: FrictionModel,
     pub router: ExecutionRouter,
     pub orphaned_tracker: OrphanedLegTracker,
     pub deadman: DeadManSnitch,
     pub books: HashMap<(Venue, Symbol), L2OrderBook>,
     pub arb_engine: CrossVenueArbEngine,
     pub momentum_engine: MicroMomentumEngine,
+    pub breakout_engine: AggressiveBreakoutEngine,
+    pub counter_punch_engine: CounterPunchEngine,
     pub last_cross_venue_opp: Option<CrossVenueOpportunity>,
     pub total_spreads_executed: u64,
     pub shm: Option<PingPongSharedMemory>,
@@ -57,11 +99,12 @@ pub struct AerisEngineNode {
     pub active_macro: MacroPayload,
     pub total_fees_paid: Fixed8,
     pub total_tds_paid: Fixed8,
+    pub is_onshore: bool,
     pub cycle_count: u64,
 }
 
 impl AerisEngineNode {
-    pub fn new(initial_equity: Fixed8, shm_path: Option<PathBuf>) -> Self {
+    pub fn new(initial_equity: Fixed8, is_onshore: bool, shm_path: Option<PathBuf>) -> Self {
         let risk_config = RiskGatewayConfig {
             max_leverage: Fixed8::from_f64(2.5),
             max_order_notional: Fixed8::from_f64(100_000.0),
@@ -70,16 +113,28 @@ impl AerisEngineNode {
 
         let risk_gateway = PreTradeRiskGateway::new(risk_config);
         let meta_gate = MetaLabelGate::new(MetaLabelGateConfig::default());
-        let friction = FrictionModel::default();
+        let friction = if is_onshore {
+            FrictionModel::default()
+        } else {
+            FrictionModel::offshore_linear()
+        };
         let router = ExecutionRouter::new(risk_gateway.clone(), friction);
 
         let arb_engine = CrossVenueArbEngine::new(
-            Fixed8::from_f64(2.0), // 2.0 bps minimum net profit hurdle after fees + TDS
-            Fixed8::from_f64(50_000.0), // $50,000 max single leg notional
+            Fixed8::from_f64(2.0),
+            Fixed8::from_f64(50_000.0),
         );
         let momentum_engine = MicroMomentumEngine::new(
-            Fixed8::from_f64(0.5), // 0.5 bps divergence threshold
-            Fixed8::from_f64(0.1), // 0.1 BTC order size
+            Fixed8::from_f64(0.005), // 0.005 bps divergence hurdle
+            Fixed8::from_f64(0.05),  // 0.05 BTC / ETH size
+        );
+        let breakout_engine = AggressiveBreakoutEngine::new(
+            Fixed8::from_f64(0.3),   // 0.3 bps breakout hurdle
+            Fixed8::from_f64(0.05),
+        );
+        let counter_punch_engine = CounterPunchEngine::new(
+            Fixed8::from_f64(0.3),   // 0.3 bps stretch hurdle
+            Fixed8::from_f64(0.05),
         );
 
         let shm = shm_path.and_then(|p| PingPongSharedMemory::create_or_open(p).ok());
@@ -92,15 +147,20 @@ impl AerisEngineNode {
             },
             realized_pnl: Fixed8::ZERO,
             paper_positions: HashMap::new(),
+            strategy_metrics: HashMap::new(),
+            recent_mids: HashMap::new(),
             total_fills_count: 0,
             risk_gateway,
             meta_gate,
+            friction,
             router,
-            orphaned_tracker: OrphanedLegTracker::new(50), // 50ms timeout
-            deadman: DeadManSnitch::new(3000),             // 3s timeout
+            orphaned_tracker: OrphanedLegTracker::new(50),
+            deadman: DeadManSnitch::new(3000),
             books: HashMap::new(),
             arb_engine,
             momentum_engine,
+            breakout_engine,
+            counter_punch_engine,
             last_cross_venue_opp: None,
             total_spreads_executed: 0,
             shm,
@@ -108,6 +168,7 @@ impl AerisEngineNode {
             active_macro: MacroPayload::default(),
             total_fees_paid: Fixed8::ZERO,
             total_tds_paid: Fixed8::ZERO,
+            is_onshore,
             cycle_count: 0,
         }
     }
@@ -124,22 +185,29 @@ impl AerisEngineNode {
         false
     }
 
-    pub fn apply_paper_fill(
+    pub fn apply_strategy_fill(
         &mut self,
+        strategy: StrategyId,
         intent: &OrderIntent,
         fill_price: Fixed8,
         fill_qty: Fixed8,
         is_maker: bool,
+        take_profit_price: Fixed8,
+        stop_loss_price: Fixed8,
         now_ns: TimestampNs,
     ) {
         let report = self.router.process_fill(intent, fill_price, fill_qty, is_maker, now_ns);
         self.total_fees_paid = self.total_fees_paid + report.fee_paid;
         self.total_tds_paid = self.total_tds_paid + report.tds_paid;
         self.total_fills_count += 1;
-
         self.account.total_equity = self.account.total_equity - report.fee_paid - report.tds_paid;
 
-        let key = (intent.venue, intent.symbol);
+        let m = self.strategy_metrics.entry(strategy).or_default();
+        m.fills_count += 1;
+        m.fees_paid = m.fees_paid + report.fee_paid;
+        m.tds_paid = m.tds_paid + report.tds_paid;
+
+        let key = (strategy, intent.venue, intent.symbol);
         if let Some(pos) = self.paper_positions.get_mut(&key) {
             if pos.side == intent.side {
                 let existing_notional = pos.avg_entry_price * pos.qty;
@@ -147,39 +215,14 @@ impl AerisEngineNode {
                 pos.qty = pos.qty + fill_qty;
                 pos.total_notional = existing_notional + new_notional;
                 pos.avg_entry_price = pos.total_notional / pos.qty;
-            } else {
-                let closed_qty = pos.qty.min(fill_qty);
-                let pnl = match pos.side {
-                    Side::Buy => (fill_price - pos.avg_entry_price) * closed_qty,
-                    Side::Sell => (pos.avg_entry_price - fill_price) * closed_qty,
-                };
-                self.realized_pnl = self.realized_pnl + pnl;
-                self.account.total_equity = self.account.total_equity + pnl;
-
-                if fill_qty >= pos.qty {
-                    let remaining_qty = fill_qty - pos.qty;
-                    if remaining_qty.is_zero() {
-                        self.paper_positions.remove(&key);
-                    } else {
-                        *pos = PaperPosition {
-                            venue: intent.venue,
-                            symbol: intent.symbol,
-                            side: intent.side,
-                            qty: remaining_qty,
-                            avg_entry_price: fill_price,
-                            total_notional: fill_price * remaining_qty,
-                            entry_time_ns: now_ns,
-                        };
-                    }
-                } else {
-                    pos.qty = pos.qty - closed_qty;
-                    pos.total_notional = pos.avg_entry_price * pos.qty;
-                }
+                pos.take_profit_price = take_profit_price;
+                pos.stop_loss_price = stop_loss_price;
             }
         } else {
             self.paper_positions.insert(
                 key,
-                PaperPosition {
+                StrategyPosition {
+                    strategy,
                     venue: intent.venue,
                     symbol: intent.symbol,
                     side: intent.side,
@@ -187,7 +230,117 @@ impl AerisEngineNode {
                     avg_entry_price: fill_price,
                     total_notional: fill_price * fill_qty,
                     entry_time_ns: now_ns,
+                    take_profit_price,
+                    stop_loss_price,
+                    entry_cycle: self.cycle_count,
                 },
+            );
+        }
+
+        self.account.total_deployed_notional = self
+            .paper_positions
+            .values()
+            .fold(Fixed8::ZERO, |acc, p| acc + p.total_notional);
+
+        println!(
+            "  [STRATEGY ENTRY] ⚡ {:?} FILLED {:?} {:?} {:.4} @ ${:.2} (TP: ${:.2} | SL: ${:.2})",
+            strategy,
+            intent.venue,
+            intent.side,
+            fill_qty.to_f64(),
+            fill_price.to_f64(),
+            take_profit_price.to_f64(),
+            stop_loss_price.to_f64()
+        );
+    }
+
+    pub fn evaluate_position_exits(&mut self, _now_ns: TimestampNs) {
+        let mut exits = Vec::new();
+
+        for (key, pos) in &self.paper_positions {
+            if let Some(book) = self.books.get(&(pos.venue, pos.symbol)) {
+                match pos.side {
+                    Side::Buy => {
+                        if let Some(bid) = book.best_bid() {
+                            let is_tp = bid.price >= pos.take_profit_price;
+                            let is_sl = bid.price <= pos.stop_loss_price;
+                            let is_timeout = (self.cycle_count.saturating_sub(pos.entry_cycle)) >= 16;
+                            if is_tp || is_sl || is_timeout {
+                                let reason = if is_tp {
+                                    "TAKE-PROFIT"
+                                } else if is_sl {
+                                    "STOP-LOSS"
+                                } else {
+                                    "TIME-DECAY"
+                                };
+                                exits.push((*key, pos.clone(), bid.price, reason));
+                            }
+                        }
+                    }
+                    Side::Sell => {
+                        if let Some(ask) = book.best_ask() {
+                            let is_tp = ask.price <= pos.take_profit_price;
+                            let is_sl = ask.price >= pos.stop_loss_price;
+                            let is_timeout = (self.cycle_count.saturating_sub(pos.entry_cycle)) >= 16;
+                            if is_tp || is_sl || is_timeout {
+                                let reason = if is_tp {
+                                    "TAKE-PROFIT"
+                                } else if is_sl {
+                                    "STOP-LOSS"
+                                } else {
+                                    "TIME-DECAY"
+                                };
+                                exits.push((*key, pos.clone(), ask.price, reason));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (key, pos, exit_price, reason) in exits {
+            self.paper_positions.remove(&key);
+
+            let exit_side = match pos.side {
+                Side::Buy => Side::Sell,
+                Side::Sell => Side::Buy,
+            };
+
+            let notional = exit_price * pos.qty;
+            let fees = self.friction.compute_fee(notional, false);
+            let tds = self.friction.compute_tds(notional, exit_side);
+
+            let gross_pnl = match pos.side {
+                Side::Buy => (exit_price - pos.avg_entry_price) * pos.qty,
+                Side::Sell => (pos.avg_entry_price - exit_price) * pos.qty,
+            };
+
+            let net_pnl = gross_pnl - fees - tds;
+            self.realized_pnl = self.realized_pnl + gross_pnl;
+            self.account.total_equity = self.account.total_equity + net_pnl;
+            self.total_fees_paid = self.total_fees_paid + fees;
+            self.total_tds_paid = self.total_tds_paid + tds;
+
+            let m = self.strategy_metrics.entry(pos.strategy).or_default();
+            m.closed_trades += 1;
+            if net_pnl.is_positive() {
+                m.winning_trades += 1;
+            }
+            m.gross_realized_pnl = m.gross_realized_pnl + gross_pnl;
+            m.fees_paid = m.fees_paid + fees;
+            m.tds_paid = m.tds_paid + tds;
+            m.net_realized_pnl = m.net_realized_pnl + net_pnl;
+
+            println!(
+                "  [STRATEGY EXIT] 🎯 {:?} triggered {} on {:?} {} | Entry: ${:.2} -> Exit: ${:.2} | Gross: ${:+.4} | Net: ${:+.4}",
+                pos.strategy,
+                reason,
+                pos.venue,
+                pos.symbol.as_str(),
+                pos.avg_entry_price.to_f64(),
+                exit_price.to_f64(),
+                gross_pnl.to_f64(),
+                net_pnl.to_f64()
             );
         }
 
@@ -199,7 +352,7 @@ impl AerisEngineNode {
 
     pub fn compute_unrealized_pnl(&self) -> Fixed8 {
         let mut total_unrealized = Fixed8::ZERO;
-        for ((venue, sym), pos) in &self.paper_positions {
+        for ((_, venue, sym), pos) in &self.paper_positions {
             if let Some(book) = self.books.get(&(*venue, *sym)) {
                 if let Some(mid) = book.mid_price() {
                     let pnl = match pos.side {
@@ -222,6 +375,14 @@ impl AerisEngineNode {
             .entry((update.venue, update.symbol))
             .or_insert_with(|| L2OrderBook::new(update.venue, update.symbol));
         book.apply_update(update);
+
+        if let Some(mid) = book.mid_price() {
+            let hist = self.recent_mids.entry((update.venue, update.symbol)).or_default();
+            hist.push(mid);
+            if hist.len() > 20 {
+                hist.remove(0);
+            }
+        }
     }
 
     pub fn execute_cycle(&mut self) -> Vec<OrderIntent> {
@@ -230,9 +391,12 @@ impl AerisEngineNode {
 
         self.poll_ipc();
 
+        // 1. Evaluate open position exits (Take-Profit / Stop-Loss / Timeout)
+        self.evaluate_position_exits(now_ns);
+
         let mut executed_intents = Vec::new();
 
-        // 1. Orphaned-Leg 50ms Timeout Check
+        // 2. Orphaned-Leg 50ms Timeout Check
         let unwinds = self.orphaned_tracker.check_timeouts(now_ns);
         for unwind in unwinds {
             println!(
@@ -244,12 +408,21 @@ impl AerisEngineNode {
                     Side::Buy => book.best_ask().map(|a| a.price).unwrap_or(unwind.price),
                     Side::Sell => book.best_bid().map(|b| b.price).unwrap_or(unwind.price),
                 };
-                self.apply_paper_fill(&unwind, fill_px, unwind.qty, false, now_ns);
+                self.apply_strategy_fill(
+                    StrategyId::CrossVenueArb,
+                    &unwind,
+                    fill_px,
+                    unwind.qty,
+                    false,
+                    fill_px,
+                    fill_px,
+                    now_ns,
+                );
             }
             executed_intents.push(unwind);
         }
 
-        // 2. Cross-Venue Net Spread Arbitrage Scanner
+        // 3. Strategy: Cross-Venue Net Spread Arbitrage Scanner
         let unique_symbols: HashSet<Symbol> = self.books.keys().map(|(_, sym)| *sym).collect();
         for sym in unique_symbols {
             let binance_book = self.books.get(&(Venue::Binance, sym)).cloned();
@@ -261,14 +434,13 @@ impl AerisEngineNode {
 
                     if let Some(spread) = self.arb_engine.generate_spread_intent(&opp, now_ns) {
                         println!(
-                            "  [STRATEGY] 🔥 ARB OPPORTUNITY: Buy {:?} @ ${:.2} | Sell {:?} @ ${:.2} | Gross: {:+.2} bps | Net: {:+.2} bps | Qty: {}",
+                            "  [STRATEGY] 🔥 ARB OPPORTUNITY: Buy {:?} @ ${:.2} | Sell {:?} @ ${:.2} | Gross: {:+.2} bps | Net: {:+.2} bps",
                             opp.buy_venue,
                             opp.buy_price.to_f64(),
                             opp.sell_venue,
                             opp.sell_price.to_f64(),
                             opp.gross_spread_bps.to_f64(),
-                            opp.net_spread_bps.to_f64(),
-                            opp.max_qty.to_f64()
+                            opp.net_spread_bps.to_f64()
                         );
 
                         let risk_a = self.risk_gateway.evaluate_order(&spread.leg_a_buy, &self.account, Some(opp.buy_price));
@@ -281,9 +453,26 @@ impl AerisEngineNode {
                                 spread.leg_b_sell,
                             );
 
-                            // Apply live paper fills for both legs
-                            self.apply_paper_fill(&spread.leg_a_buy, opp.buy_price, spread.executable_qty, false, now_ns);
-                            self.apply_paper_fill(&spread.leg_b_sell, opp.sell_price, spread.executable_qty, false, now_ns);
+                            self.apply_strategy_fill(
+                                StrategyId::CrossVenueArb,
+                                &spread.leg_a_buy,
+                                opp.buy_price,
+                                spread.executable_qty,
+                                false,
+                                opp.buy_price * Fixed8::from_f64(1.0005),
+                                opp.buy_price * Fixed8::from_f64(0.9995),
+                                now_ns,
+                            );
+                            self.apply_strategy_fill(
+                                StrategyId::CrossVenueArb,
+                                &spread.leg_b_sell,
+                                opp.sell_price,
+                                spread.executable_qty,
+                                false,
+                                opp.sell_price * Fixed8::from_f64(0.9995),
+                                opp.sell_price * Fixed8::from_f64(1.0005),
+                                now_ns,
+                            );
 
                             self.orphaned_tracker.record_fill(spread.leg_a_buy.client_order_id, now_ns);
                             self.orphaned_tracker.record_fill(spread.leg_b_sell.client_order_id, now_ns);
@@ -297,13 +486,104 @@ impl AerisEngineNode {
             }
         }
 
-        // 3. Stoikov Micro-Divergence Momentum Scanner
+        // 4. Strategy: Stoikov Micro-Divergence Momentum Scanner
         let books_snapshot: Vec<aeris_feed::L2OrderBook> = self.books.values().cloned().collect();
         for book in &books_snapshot {
-            if let Some(intent) = self.momentum_engine.evaluate_signal(book, self.active_macro.macro_bias, now_ns) {
-                if self.risk_gateway.evaluate_order(&intent, &self.account, Some(intent.price)).is_ok() {
-                    self.apply_paper_fill(&intent, intent.price, intent.qty, false, now_ns);
-                    executed_intents.push(intent);
+            let key = (StrategyId::StoikovMicro, book.venue, book.symbol);
+            if !self.paper_positions.contains_key(&key) {
+                if let Some(intent) = self.momentum_engine.evaluate_signal(book, self.active_macro.macro_bias, now_ns) {
+                    if self.risk_gateway.evaluate_order(&intent, &self.account, Some(intent.price)).is_ok() {
+                        let (tp, sl) = match intent.side {
+                            Side::Buy => (
+                                intent.price * Fixed8::from_f64(1.00015),
+                                intent.price * Fixed8::from_f64(0.99990),
+                            ),
+                            Side::Sell => (
+                                intent.price * Fixed8::from_f64(0.99985),
+                                intent.price * Fixed8::from_f64(1.00010),
+                            ),
+                        };
+                        self.apply_strategy_fill(
+                            StrategyId::StoikovMicro,
+                            &intent,
+                            intent.price,
+                            intent.qty,
+                            false,
+                            tp,
+                            sl,
+                            now_ns,
+                        );
+                        executed_intents.push(intent);
+                    }
+                }
+            }
+        }
+
+        // 5. Strategy: Aggressive Breakout Engine
+        for book in &books_snapshot {
+            let key = (StrategyId::AggressiveBreakout, book.venue, book.symbol);
+            if !self.paper_positions.contains_key(&key) {
+                let mids = self.recent_mids.get(&(book.venue, book.symbol)).cloned().unwrap_or_default();
+                if let Some(intent) = self.breakout_engine.evaluate(book, &mids, now_ns) {
+                    if self.risk_gateway.evaluate_order(&intent, &self.account, Some(intent.price)).is_ok() {
+                        let (tp, sl) = match intent.side {
+                            Side::Buy => (
+                                intent.price * Fixed8::from_f64(1.00025),
+                                intent.price * Fixed8::from_f64(0.99985),
+                            ),
+                            Side::Sell => (
+                                intent.price * Fixed8::from_f64(0.99975),
+                                intent.price * Fixed8::from_f64(1.00015),
+                            ),
+                        };
+                        self.apply_strategy_fill(
+                            StrategyId::AggressiveBreakout,
+                            &intent,
+                            intent.price,
+                            intent.qty,
+                            false,
+                            tp,
+                            sl,
+                            now_ns,
+                        );
+                        executed_intents.push(intent);
+                    }
+                }
+            }
+        }
+
+        // 6. Strategy: Counter-Punch Micro-Wick Mean Reversion
+        for book in &books_snapshot {
+            let key = (StrategyId::CounterPunch, book.venue, book.symbol);
+            if !self.paper_positions.contains_key(&key) {
+                let mids = self.recent_mids.get(&(book.venue, book.symbol)).cloned().unwrap_or_default();
+                if mids.len() >= 3 {
+                    let mean: Fixed8 = mids.iter().fold(Fixed8::ZERO, |acc, m| acc + *m) / Fixed8::from_f64(mids.len() as f64);
+                    if let Some(intent) = self.counter_punch_engine.evaluate(book, mean, now_ns) {
+                        if self.risk_gateway.evaluate_order(&intent, &self.account, Some(intent.price)).is_ok() {
+                            let (tp, sl) = match intent.side {
+                                Side::Buy => (
+                                    intent.price * Fixed8::from_f64(1.00020),
+                                    intent.price * Fixed8::from_f64(0.99985),
+                                ),
+                                Side::Sell => (
+                                    intent.price * Fixed8::from_f64(0.99980),
+                                    intent.price * Fixed8::from_f64(1.00015),
+                                ),
+                            };
+                            self.apply_strategy_fill(
+                                StrategyId::CounterPunch,
+                                &intent,
+                                intent.price,
+                                intent.qty,
+                                false,
+                                tp,
+                                sl,
+                                now_ns,
+                            );
+                            executed_intents.push(intent);
+                        }
+                    }
                 }
             }
         }
@@ -342,7 +622,7 @@ impl AerisEngineNode {
             self.total_tds_paid.to_f64()
         );
         println!(
-            " Macro Bias: {} | IPC Seq: {} | Spreads: {} | Total Fills: {}",
+            " Macro Bias: {} | IPC Seq: {} | Spreads Executed: {} | Total Fills: {}",
             match self.active_macro.macro_bias {
                 1 => "SUPPLY_SQUEEZE (Bullish)",
                 2 => "DISTRIBUTION (Bearish)",
@@ -368,41 +648,99 @@ impl AerisEngineNode {
 
         if !self.paper_positions.is_empty() {
             println!("   --- ACTIVE PAPER INVENTORY ---");
-            for ((venue, sym), pos) in &self.paper_positions {
+            for ((strat, venue, sym), pos) in &self.paper_positions {
                 println!(
-                    "    * {:?} {} {:?}: {:.4} units @ ${:.2} (Notional: ${:.2})",
+                    "    * [{}] {:?} {} {:?}: {:.4} units @ ${:.2} (TP: ${:.2} | SL: ${:.2})",
+                    strat.name(),
                     venue,
                     sym.as_str(),
                     pos.side,
                     pos.qty.to_f64(),
                     pos.avg_entry_price.to_f64(),
-                    pos.total_notional.to_f64()
+                    pos.take_profit_price.to_f64(),
+                    pos.stop_loss_price.to_f64()
                 );
             }
         }
 
-        for ((venue, sym), book) in &self.books {
-            let bbo_bid = book.best_bid().map(|b| b.price.to_f64()).unwrap_or(0.0);
-            let bbo_ask = book.best_ask().map(|a| a.price.to_f64()).unwrap_or(0.0);
-            let mid = book.mid_price().map(|m| m.to_f64()).unwrap_or(0.0);
-            let micro = book.micro_price().map(|m| m.to_f64()).unwrap_or(0.0);
-            let div_bps = book
-                .micro_price_divergence_bps()
-                .map(|d| d.to_f64())
-                .unwrap_or(0.0);
+        // SHOWDOWN LEADERBOARD
+        let strats = [
+            StrategyId::StoikovMicro,
+            StrategyId::AggressiveBreakout,
+            StrategyId::CounterPunch,
+            StrategyId::CrossVenueArb,
+        ];
+
+        let mut leaderboard_data = Vec::new();
+        for &st in &strats {
+            let m = self.strategy_metrics.get(&st).cloned().unwrap_or_default();
+
+            let mut u_pnl = Fixed8::ZERO;
+            for ((s, venue, sym), pos) in &self.paper_positions {
+                if *s == st {
+                    if let Some(book) = self.books.get(&(*venue, *sym)) {
+                        if let Some(mid) = book.mid_price() {
+                            let p = match pos.side {
+                                Side::Buy => (mid - pos.avg_entry_price) * pos.qty,
+                                Side::Sell => (pos.avg_entry_price - mid) * pos.qty,
+                            };
+                            u_pnl = u_pnl + p;
+                        }
+                    }
+                }
+            }
+
+            let net_alpha = m.net_realized_pnl + u_pnl;
+            let win_rate = if m.closed_trades > 0 {
+                (m.winning_trades as f64 / m.closed_trades as f64) * 100.0
+            } else {
+                0.0
+            };
+
+            leaderboard_data.push((st, m, u_pnl, net_alpha, win_rate));
+        }
+
+        leaderboard_data.sort_by(|a, b| b.3.cmp(&a.3));
+
+        println!("--------------------------------------------------------------------------------");
+        println!("                   AERIS MULTI-STRATEGY SHOWDOWN LEADERBOARD                    ");
+        println!("--------------------------------------------------------------------------------");
+        println!(" Rank | Strategy           | Status   | Trades | Win%  | Gross PnL | Fees/TDS | Net Alpha ");
+        println!("------+--------------------+----------+--------+-------+-----------+----------+-----------");
+
+        for (idx, (st, m, _u_pnl, net_alpha, win_rate)) in leaderboard_data.iter().enumerate() {
+            let rank_str = format!("#{}", idx + 1);
+            let status_str = if idx == 0 && net_alpha.is_positive() {
+                "LEADER"
+            } else if m.fills_count > 0 {
+                "ACTIVE"
+            } else {
+                "HUNTING"
+            };
 
             println!(
-                "   [{:?} {}] Bid: ${:.2} | Ask: ${:.2} | Mid: ${:.2} | Micro: ${:.2} (Div: {:+.2} bps)",
-                venue,
-                sym.as_str(),
-                bbo_bid,
-                bbo_ask,
-                mid,
-                micro,
-                div_bps
+                " {:4} | {:18} | {:8} | {:6} | {:4.1}% | ${:+.4} | ${:7.4} | ${:+.4} ",
+                rank_str,
+                st.name(),
+                status_str,
+                m.closed_trades,
+                win_rate,
+                m.gross_realized_pnl.to_f64(),
+                (m.fees_paid + m.tds_paid).to_f64(),
+                net_alpha.to_f64()
             );
         }
-        println!("================================================================================");
+
+        let best = &leaderboard_data[0];
+        println!("--------------------------------------------------------------------------------");
+        println!(
+            " 🏆 STRONGEST STRATEGY: {} (Net Alpha: ${:+.4} | Win Rate: {:.1}% | Closed: {})",
+            best.0.name(),
+            best.3.to_f64(),
+            best.4,
+            best.1.closed_trades
+        );
+        println!("================================================================================\n");
     }
 }
 
@@ -418,54 +756,59 @@ async fn main() {
         .iter()
         .position(|a| a == "--ticks")
         .and_then(|i| args.get(i + 1))
-        .and_then(|s| s.parse::<u64>().ok());
-
-    let shm_path = PathBuf::from(
-        "D:/Pushp - Do not open without permission/AERIS/Python Playground/data/aeris_shm.dat",
-    );
-    let mut node = AerisEngineNode::new(Fixed8::from_f64(100_000.0), Some(shm_path));
+        .and_then(|v| v.parse().ok());
 
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
 
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
-        println!("\n[INFO] Shutdown signal received. Stopping Aeris Engine Node...");
+        println!("\n[SHUTDOWN] Received Ctrl+C. Initiating graceful shutdown of Aeris Node...");
         r.store(false, Ordering::SeqCst);
     });
 
-    // Spawn GD (Guardian Daemon) Heartbeat Watchdog Sender
-    let r_gd = running.clone();
-    tokio::spawn(async move {
-        let dest = format!("127.0.0.1:{}", aeris_gd::DEFAULT_GD_PORT);
-        if let Ok(socket) = tokio::net::UdpSocket::bind("127.0.0.1:0").await {
-            let mut seq = 0;
-            while r_gd.load(Ordering::SeqCst) {
-                seq += 1;
-                let packet = aeris_gd::HeartbeatPacket {
-                    seq,
-                    timestamp_ns: current_time_ns(),
-                    active_positions_count: 0,
-                    auth_token: aeris_gd::AUTH_MAGIC_TOKEN,
-                    is_disarm: false,
-                };
-                if let Ok(bytes) = serde_json::to_vec(&packet) {
-                    let _ = socket.send_to(&bytes, &dest).await;
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
+    let is_onshore = args.iter().any(|a| a == "--onshore");
+    let mut node = AerisEngineNode::new(
+        Fixed8::from_f64(100_000.0),
+        is_onshore,
+        Some(PathBuf::from("D:/Pushp - Do not open without permission/AERIS/data/aeris_shm.dat")),
+    );
 
-            // Disarm GD cleanly on authorized shutdown
-            let disarm = aeris_gd::HeartbeatPacket {
-                seq: seq + 1,
+    let gd_target = "127.0.0.1:9876";
+    let gd_running = running.clone();
+    tokio::spawn(async move {
+        let socket = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let dest = gd_target.to_string();
+        let mut seq: u64 = 0;
+        let auth_token = aeris_gd::AUTH_MAGIC_TOKEN;
+
+        while gd_running.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            seq += 1;
+            let packet = aeris_gd::HeartbeatPacket {
+                auth_token,
+                seq,
                 timestamp_ns: current_time_ns(),
                 active_positions_count: 0,
-                auth_token: aeris_gd::AUTH_MAGIC_TOKEN,
-                is_disarm: true,
+                is_disarm: false,
             };
-            if let Ok(bytes) = serde_json::to_vec(&disarm) {
+            if let Ok(bytes) = serde_json::to_vec(&packet) {
                 let _ = socket.send_to(&bytes, &dest).await;
             }
+        }
+
+        let disarm = aeris_gd::HeartbeatPacket {
+            auth_token,
+            seq: seq + 1,
+            timestamp_ns: current_time_ns(),
+            active_positions_count: 0,
+            is_disarm: true,
+        };
+        if let Ok(bytes) = serde_json::to_vec(&disarm) {
+            let _ = socket.send_to(&bytes, &dest).await;
         }
     });
 
@@ -500,13 +843,6 @@ async fn main() {
                 biased;
                 Some(update) = rx.recv() => {
                     node.on_book_update(&update);
-                    println!(
-                        "  -> [LIVE FEED] {:?} {} | Best Bid: ${:.2} | Best Ask: ${:.2}",
-                        update.venue,
-                        update.symbol.as_str(),
-                        update.bids.first().map(|b| b.price.to_f64()).unwrap_or(0.0),
-                        update.asks.first().map(|a| a.price.to_f64()).unwrap_or(0.0)
-                    );
                 }
                 _ = interval.tick() => {
                     node.execute_cycle();
@@ -523,15 +859,21 @@ async fn main() {
     } else {
         println!("[INFO] Initialized node with $100,000.00 equity in SIMULATION mode.");
         let btc_sym = Symbol::from_str_truncate("BTCUSDT");
-        let avax_sym = Symbol::from_str_truncate("AVAXUSDT");
 
         let mut tick_counter: u64 = 0;
-        let limit = max_ticks.unwrap_or(5);
+        let limit = max_ticks.unwrap_or(20);
 
         while running.load(Ordering::SeqCst) && tick_counter < limit {
             tick_counter += 1;
 
-            let btc_bid = 60_000.0 + (tick_counter as f64 * 0.5);
+            let phase = tick_counter as f64;
+            let btc_base = 60_000.0 + (phase * 1.5).sin() * 8.0 + (if phase > 10.0 { 6.0 } else { 0.0 });
+            let btc_bid = btc_base;
+            let btc_ask = btc_base + 1.0;
+
+            let bid_q = if phase % 4.0 == 1.0 { 15.0 } else { 2.0 };
+            let ask_q = if phase % 4.0 == 3.0 { 15.0 } else { 2.0 };
+
             let btc_update = BookUpdate {
                 venue: Venue::Binance,
                 symbol: btc_sym,
@@ -539,7 +881,7 @@ async fn main() {
                 bids: vec![
                     BookLevel {
                         price: Fixed8::from_f64(btc_bid),
-                        qty: Fixed8::from_f64(12.5),
+                        qty: Fixed8::from_f64(bid_q),
                     },
                     BookLevel {
                         price: Fixed8::from_f64(btc_bid - 5.0),
@@ -548,57 +890,38 @@ async fn main() {
                 ],
                 asks: vec![
                     BookLevel {
-                        price: Fixed8::from_f64(btc_bid + 5.0),
-                        qty: Fixed8::from_f64(2.0),
+                        price: Fixed8::from_f64(btc_ask),
+                        qty: Fixed8::from_f64(ask_q),
                     },
                     BookLevel {
-                        price: Fixed8::from_f64(btc_bid + 10.0),
-                        qty: Fixed8::from_f64(5.0),
+                        price: Fixed8::from_f64(btc_ask + 5.0),
+                        qty: Fixed8::from_f64(10.0),
                     },
                 ],
                 is_snapshot: true,
             };
             node.on_book_update(&btc_update);
 
-            let bybit_btc_ask = btc_bid + 2.0;
-            let bybit_btc_bid = btc_bid - 3.0;
             let bybit_btc_update = BookUpdate {
                 venue: Venue::Bybit,
                 symbol: btc_sym,
                 timestamp_ns: current_time_ns(),
                 bids: vec![BookLevel {
-                    price: Fixed8::from_f64(bybit_btc_bid),
-                    qty: Fixed8::from_f64(8.0),
+                    price: Fixed8::from_f64(btc_bid - 0.5),
+                    qty: Fixed8::from_f64(10.0),
                 }],
                 asks: vec![BookLevel {
-                    price: Fixed8::from_f64(bybit_btc_ask),
+                    price: Fixed8::from_f64(btc_ask + 0.5),
                     qty: Fixed8::from_f64(10.0),
                 }],
                 is_snapshot: true,
             };
             node.on_book_update(&bybit_btc_update);
 
-            let avax_bid = 30.0 + (tick_counter as f64 * 0.02);
-            let avax_update = BookUpdate {
-                venue: Venue::Bybit,
-                symbol: avax_sym,
-                timestamp_ns: current_time_ns(),
-                bids: vec![BookLevel {
-                    price: Fixed8::from_f64(avax_bid),
-                    qty: Fixed8::from_f64(500.0),
-                }],
-                asks: vec![BookLevel {
-                    price: Fixed8::from_f64(avax_bid + 0.05),
-                    qty: Fixed8::from_f64(150.0),
-                }],
-                is_snapshot: true,
-            };
-            node.on_book_update(&avax_update);
-
             node.execute_cycle();
             node.print_status();
 
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
 
