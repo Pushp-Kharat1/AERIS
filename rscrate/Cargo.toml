@@ -9,6 +9,7 @@ members = [
     "aeris-strategy",
     "aeris-node",
     "aeris-gd",
+    "aeris-backtest",
 ]
 
 [workspace.package]

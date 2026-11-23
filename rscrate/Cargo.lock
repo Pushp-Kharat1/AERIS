@@ -3,6 +3,20 @@
 version = 4
 
 [[package]]
+name = "aeris-backtest"
+version = "0.1.0"
+dependencies = [
+ "aeris-core",
+ "aeris-execution",
+ "aeris-feed",
+ "aeris-risk",
+ "aeris-strategy",
+ "rand 0.8.8",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "aeris-core"
 version = "0.1.0"
 dependencies = [

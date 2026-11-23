@@ -67,6 +67,7 @@ pub struct StrategyMetrics {
     pub fills_count: u64,
     pub closed_trades: u64,
     pub winning_trades: u64,
+    pub gross_winning_trades: u64,
     pub internal_crosses_count: u64,
     pub fees_saved: Fixed8,
     pub gross_realized_pnl: Fixed8,
@@ -113,6 +114,7 @@ pub struct AerisEngineNode {
     pub total_tds_paid: Fixed8,
     pub is_onshore: bool,
     pub cycle_count: u64,
+    pub last_entry_time_ns: HashMap<(StrategyId, Venue, Symbol), TimestampNs>,
 }
 
 impl AerisEngineNode {
@@ -184,6 +186,7 @@ impl AerisEngineNode {
             total_tds_paid: Fixed8::ZERO,
             is_onshore,
             cycle_count: 0,
+            last_entry_time_ns: HashMap::new(),
         }
     }
 
@@ -358,6 +361,9 @@ impl AerisEngineNode {
 
             let m = self.strategy_metrics.entry(pos.strategy).or_default();
             m.closed_trades += 1;
+            if gross_pnl.is_positive() {
+                m.gross_winning_trades += 1;
+            }
             if net_pnl.is_positive() {
                 m.winning_trades += 1;
             }
@@ -389,12 +395,23 @@ impl AerisEngineNode {
         let mut total_unrealized = Fixed8::ZERO;
         for ((_, venue, sym), pos) in &self.paper_positions {
             if let Some(book) = self.books.get(&(*venue, *sym)) {
-                if let Some(mid) = book.mid_price() {
-                    let pnl = match pos.side {
-                        Side::Buy => (mid - pos.avg_entry_price) * pos.qty,
-                        Side::Sell => (pos.avg_entry_price - mid) * pos.qty,
+                let exit_px = match pos.side {
+                    Side::Buy => book.best_bid().map(|b| b.price),
+                    Side::Sell => book.best_ask().map(|a| a.price),
+                };
+                if let Some(px) = exit_px {
+                    let gross = match pos.side {
+                        Side::Buy => (px - pos.avg_entry_price) * pos.qty,
+                        Side::Sell => (pos.avg_entry_price - px) * pos.qty,
                     };
-                    total_unrealized = total_unrealized + pnl;
+                    let notional = px * pos.qty;
+                    let est_fee = self.friction.compute_fee(notional, false);
+                    let exit_side = match pos.side {
+                        Side::Buy => Side::Sell,
+                        Side::Sell => Side::Buy,
+                    };
+                    let est_tds = self.friction.compute_tds(notional, exit_side);
+                    total_unrealized = total_unrealized + gross - est_fee - est_tds;
                 }
             }
         }
@@ -843,36 +860,52 @@ impl AerisEngineNode {
             for ((s, venue, sym), pos) in &self.paper_positions {
                 if *s == st {
                     if let Some(book) = self.books.get(&(*venue, *sym)) {
-                        if let Some(mid) = book.mid_price() {
-                            let p = match pos.side {
-                                Side::Buy => (mid - pos.avg_entry_price) * pos.qty,
-                                Side::Sell => (pos.avg_entry_price - mid) * pos.qty,
+                        let exit_px = match pos.side {
+                            Side::Buy => book.best_bid().map(|b| b.price),
+                            Side::Sell => book.best_ask().map(|a| a.price),
+                        };
+                        if let Some(px) = exit_px {
+                            let gross = match pos.side {
+                                Side::Buy => (px - pos.avg_entry_price) * pos.qty,
+                                Side::Sell => (pos.avg_entry_price - px) * pos.qty,
                             };
-                            u_pnl = u_pnl + p;
+                            let notional = px * pos.qty;
+                            let est_fee = self.friction.compute_fee(notional, false);
+                            let exit_side = match pos.side {
+                                Side::Buy => Side::Sell,
+                                Side::Sell => Side::Buy,
+                            };
+                            let est_tds = self.friction.compute_tds(notional, exit_side);
+                            u_pnl = u_pnl + gross - est_fee - est_tds;
                         }
                     }
                 }
             }
 
             let net_alpha = m.net_realized_pnl + u_pnl;
-            let win_rate = if m.closed_trades > 0 {
+            let net_win_rate = if m.closed_trades > 0 {
                 (m.winning_trades as f64 / m.closed_trades as f64) * 100.0
             } else {
                 0.0
             };
+            let gross_win_rate = if m.closed_trades > 0 {
+                (m.gross_winning_trades as f64 / m.closed_trades as f64) * 100.0
+            } else {
+                0.0
+            };
 
-            leaderboard_data.push((st, m, u_pnl, net_alpha, win_rate));
+            leaderboard_data.push((st, m, u_pnl, net_alpha, net_win_rate, gross_win_rate));
         }
 
         leaderboard_data.sort_by(|a, b| b.3.cmp(&a.3));
 
-        println!("--------------------------------------------------------------------------------");
-        println!("                   AERIS MULTI-STRATEGY SHOWDOWN LEADERBOARD                    ");
-        println!("--------------------------------------------------------------------------------");
-        println!(" Rank | Strategy           | Status   | Trades | Win%  | Crosses | Saved Fees | Net Alpha ");
-        println!("------+--------------------+----------+--------+-------+---------+------------+-----------");
+        println!("------------------------------------------------------------------------------------------------------");
+        println!("                         AERIS MULTI-STRATEGY SHOWDOWN LEADERBOARD (UNBIASED MTM)                      ");
+        println!("------------------------------------------------------------------------------------------------------");
+        println!(" Rank | Strategy           | Status   | Trades | Gross W% | Net W%  | Gross PnL | Fees Paid | Net Alpha ");
+        println!("------+--------------------+----------+--------+----------+---------+-----------+-----------+-----------");
 
-        for (idx, (st, m, _u_pnl, net_alpha, win_rate)) in leaderboard_data.iter().enumerate() {
+        for (idx, (st, m, _u_pnl, net_alpha, net_win_rate, gross_win_rate)) in leaderboard_data.iter().enumerate() {
             let rank_str = format!("#{}", idx + 1);
             let status_str = if idx == 0 && net_alpha.is_positive() {
                 "LEADER"
@@ -883,28 +916,30 @@ impl AerisEngineNode {
             };
 
             println!(
-                " {:4} | {:18} | {:8} | {:6} | {:4.1}% | {:7} | +${:9.4} | ${:+.4} ",
+                " {:4} | {:18} | {:8} | {:6} | {:7.1}% | {:6.1}% | ${:+9.2} | -${:8.2} | ${:+.4} ",
                 rank_str,
                 st.name(),
                 status_str,
                 m.closed_trades,
-                win_rate,
-                m.internal_crosses_count,
-                m.fees_saved.to_f64(),
+                gross_win_rate,
+                net_win_rate,
+                m.gross_realized_pnl.to_f64(),
+                m.fees_paid.to_f64(),
                 net_alpha.to_f64()
             );
         }
 
         let best = &leaderboard_data[0];
-        println!("--------------------------------------------------------------------------------");
+        println!("------------------------------------------------------------------------------------------------------");
         println!(
-            " 🏆 STRONGEST STRATEGY: {} (Net Alpha: ${:+.4} | Win Rate: {:.1}% | Saved Fees: +${:.4})",
+            " 🏆 STRONGEST STRATEGY: {} (Net Alpha: ${:+.4} | Net Win%: {:.1}% | Gross Win%: {:.1}% | Saved Fees: +${:.4})",
             best.0.name(),
             best.3.to_f64(),
             best.4,
+            best.5,
             best.1.fees_saved.to_f64()
         );
-        println!("================================================================================\n");
+        println!("======================================================================================================\n");
     }
 }
 
@@ -917,18 +952,11 @@ async fn main() {
     let args: Vec<String> = std::env::args().collect();
     let is_live = args.iter().any(|a| a == "--live");
     let is_onshore = args.iter().any(|a| a == "--onshore");
-    let duration_mins: Option<u64> = args
-        .iter()
-        .position(|a| a == "--duration-mins")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|v| v.parse().ok());
-
     let max_ticks: Option<u64> = args
         .iter()
         .position(|a| a == "--ticks")
         .and_then(|i| args.get(i + 1))
-        .and_then(|v| v.parse().ok())
-        .or_else(|| duration_mins.map(|m| m * 120));
+        .and_then(|v| v.parse().ok());
 
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -1017,10 +1045,8 @@ async fn main() {
                 }
                 _ = interval.tick() => {
                     node.execute_cycle();
+                    node.print_status();
                     ticks += 1;
-                    if ticks % 10 == 0 || (max_ticks.is_some() && ticks >= max_ticks.unwrap()) {
-                        node.print_status();
-                    }
                     if let Some(limit) = max_ticks {
                         if ticks >= limit {
                             break;
@@ -1098,9 +1124,5 @@ async fn main() {
         }
     }
 
-    println!("\n================================================================================");
-    println!("             FINAL MULTI-STRATEGY SOAK BENCHMARK REPORT                         ");
-    println!("================================================================================");
-    node.print_status();
     println!("[INFO] Node execution completed cleanly.");
 }
