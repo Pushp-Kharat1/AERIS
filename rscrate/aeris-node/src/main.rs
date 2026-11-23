@@ -67,10 +67,20 @@ pub struct StrategyMetrics {
     pub fills_count: u64,
     pub closed_trades: u64,
     pub winning_trades: u64,
+    pub internal_crosses_count: u64,
+    pub fees_saved: Fixed8,
     pub gross_realized_pnl: Fixed8,
     pub fees_paid: Fixed8,
     pub tds_paid: Fixed8,
     pub net_realized_pnl: Fixed8,
+}
+
+#[derive(Clone, Debug)]
+pub struct StrategyCandidate {
+    pub strategy: StrategyId,
+    pub intent: OrderIntent,
+    pub take_profit_price: Fixed8,
+    pub stop_loss_price: Fixed8,
 }
 
 pub struct AerisEngineNode {
@@ -81,6 +91,8 @@ pub struct AerisEngineNode {
     pub strategy_metrics: HashMap<StrategyId, StrategyMetrics>,
     pub recent_mids: HashMap<(Venue, Symbol), Vec<Fixed8>>,
     pub total_fills_count: u64,
+    pub total_internal_crosses: u64,
+    pub total_fees_saved: Fixed8,
     pub risk_gateway: PreTradeRiskGateway,
     pub meta_gate: MetaLabelGate,
     pub friction: FrictionModel,
@@ -125,15 +137,15 @@ impl AerisEngineNode {
             Fixed8::from_f64(50_000.0),
         );
         let momentum_engine = MicroMomentumEngine::new(
-            Fixed8::from_f64(0.005), // 0.005 bps divergence hurdle
+            Fixed8::from_f64(0.005), // 0.005 bps divergence threshold
             Fixed8::from_f64(0.05),  // 0.05 BTC / ETH size
         );
         let breakout_engine = AggressiveBreakoutEngine::new(
-            Fixed8::from_f64(0.3),   // 0.3 bps breakout hurdle
+            Fixed8::from_f64(0.3),   // 0.3 bps breakout threshold
             Fixed8::from_f64(0.05),
         );
         let counter_punch_engine = CounterPunchEngine::new(
-            Fixed8::from_f64(0.3),   // 0.3 bps stretch hurdle
+            Fixed8::from_f64(0.3),   // 0.3 bps stretch threshold
             Fixed8::from_f64(0.05),
         );
 
@@ -150,6 +162,8 @@ impl AerisEngineNode {
             strategy_metrics: HashMap::new(),
             recent_mids: HashMap::new(),
             total_fills_count: 0,
+            total_internal_crosses: 0,
+            total_fees_saved: Fixed8::ZERO,
             risk_gateway,
             meta_gate,
             friction,
@@ -192,20 +206,30 @@ impl AerisEngineNode {
         fill_price: Fixed8,
         fill_qty: Fixed8,
         is_maker: bool,
+        is_internal_cross: bool,
         take_profit_price: Fixed8,
         stop_loss_price: Fixed8,
         now_ns: TimestampNs,
     ) {
-        let report = self.router.process_fill(intent, fill_price, fill_qty, is_maker, now_ns);
-        self.total_fees_paid = self.total_fees_paid + report.fee_paid;
-        self.total_tds_paid = self.total_tds_paid + report.tds_paid;
+        let (fee_paid, tds_paid) = if is_internal_cross {
+            (Fixed8::ZERO, Fixed8::ZERO)
+        } else {
+            let report = self.router.process_fill(intent, fill_price, fill_qty, is_maker, now_ns);
+            (report.fee_paid, report.tds_paid)
+        };
+
+        self.total_fees_paid = self.total_fees_paid + fee_paid;
+        self.total_tds_paid = self.total_tds_paid + tds_paid;
         self.total_fills_count += 1;
-        self.account.total_equity = self.account.total_equity - report.fee_paid - report.tds_paid;
+        self.account.total_equity = self.account.total_equity - fee_paid - tds_paid;
 
         let m = self.strategy_metrics.entry(strategy).or_default();
         m.fills_count += 1;
-        m.fees_paid = m.fees_paid + report.fee_paid;
-        m.tds_paid = m.tds_paid + report.tds_paid;
+        if is_internal_cross {
+            m.internal_crosses_count += 1;
+        }
+        m.fees_paid = m.fees_paid + fee_paid;
+        m.tds_paid = m.tds_paid + tds_paid;
 
         let key = (strategy, intent.venue, intent.symbol);
         if let Some(pos) = self.paper_positions.get_mut(&key) {
@@ -242,16 +266,27 @@ impl AerisEngineNode {
             .values()
             .fold(Fixed8::ZERO, |acc, p| acc + p.total_notional);
 
-        println!(
-            "  [STRATEGY ENTRY] ⚡ {:?} FILLED {:?} {:?} {:.4} @ ${:.2} (TP: ${:.2} | SL: ${:.2})",
-            strategy,
-            intent.venue,
-            intent.side,
-            fill_qty.to_f64(),
-            fill_price.to_f64(),
-            take_profit_price.to_f64(),
-            stop_loss_price.to_f64()
-        );
+        if is_internal_cross {
+            println!(
+                "  [DARK POOL FILL] ⚡ {:?} CROSS-FILLED {:?} {:?} {:.4} @ ${:.2} (ZERO EXCHANGE FEES!)",
+                strategy,
+                intent.venue,
+                intent.side,
+                fill_qty.to_f64(),
+                fill_price.to_f64(),
+            );
+        } else {
+            println!(
+                "  [STRATEGY ENTRY] ⚡ {:?} FILLED {:?} {:?} {:.4} @ ${:.2} (TP: ${:.2} | SL: ${:.2})",
+                strategy,
+                intent.venue,
+                intent.side,
+                fill_qty.to_f64(),
+                fill_price.to_f64(),
+                take_profit_price.to_f64(),
+                stop_loss_price.to_f64()
+            );
+        }
     }
 
     pub fn evaluate_position_exits(&mut self, _now_ns: TimestampNs) {
@@ -414,6 +449,7 @@ impl AerisEngineNode {
                     fill_px,
                     unwind.qty,
                     false,
+                    false,
                     fill_px,
                     fill_px,
                     now_ns,
@@ -459,6 +495,7 @@ impl AerisEngineNode {
                                 opp.buy_price,
                                 spread.executable_qty,
                                 false,
+                                false,
                                 opp.buy_price * Fixed8::from_f64(1.0005),
                                 opp.buy_price * Fixed8::from_f64(0.9995),
                                 now_ns,
@@ -468,6 +505,7 @@ impl AerisEngineNode {
                                 &spread.leg_b_sell,
                                 opp.sell_price,
                                 spread.executable_qty,
+                                false,
                                 false,
                                 opp.sell_price * Fixed8::from_f64(0.9995),
                                 opp.sell_price * Fixed8::from_f64(1.0005),
@@ -486,34 +524,41 @@ impl AerisEngineNode {
             }
         }
 
-        // 4. Strategy: Stoikov Micro-Divergence Momentum Scanner
+        // Collect Candidate Orders for Directional / Microstructure Strategies
+        let mut candidates: Vec<StrategyCandidate> = Vec::new();
+        let macro_bias = self.active_macro.macro_bias;
         let books_snapshot: Vec<aeris_feed::L2OrderBook> = self.books.values().cloned().collect();
+
+        // 4. Strategy: Stoikov Micro-Divergence Momentum Scanner
         for book in &books_snapshot {
             let key = (StrategyId::StoikovMicro, book.venue, book.symbol);
             if !self.paper_positions.contains_key(&key) {
-                if let Some(intent) = self.momentum_engine.evaluate_signal(book, self.active_macro.macro_bias, now_ns) {
-                    if self.risk_gateway.evaluate_order(&intent, &self.account, Some(intent.price)).is_ok() {
+                if let Some(intent) = self.momentum_engine.evaluate_signal(book, macro_bias, now_ns) {
+                    // Macro-conditioning filter:
+                    // In Supply Squeeze (bias 1), reject sell; in Distribution (bias 2), reject buy
+                    let pass_macro = match (intent.side, macro_bias) {
+                        (Side::Sell, 1) => false,
+                        (Side::Buy, 2) => false,
+                        _ => true,
+                    };
+
+                    if pass_macro && self.risk_gateway.evaluate_order(&intent, &self.account, Some(intent.price)).is_ok() {
                         let (tp, sl) = match intent.side {
                             Side::Buy => (
-                                intent.price * Fixed8::from_f64(1.00015),
-                                intent.price * Fixed8::from_f64(0.99990),
+                                intent.price * Fixed8::from_f64(1.00030),
+                                intent.price * Fixed8::from_f64(0.99975),
                             ),
                             Side::Sell => (
-                                intent.price * Fixed8::from_f64(0.99985),
-                                intent.price * Fixed8::from_f64(1.00010),
+                                intent.price * Fixed8::from_f64(0.99970),
+                                intent.price * Fixed8::from_f64(1.00025),
                             ),
                         };
-                        self.apply_strategy_fill(
-                            StrategyId::StoikovMicro,
-                            &intent,
-                            intent.price,
-                            intent.qty,
-                            false,
-                            tp,
-                            sl,
-                            now_ns,
-                        );
-                        executed_intents.push(intent);
+                        candidates.push(StrategyCandidate {
+                            strategy: StrategyId::StoikovMicro,
+                            intent,
+                            take_profit_price: tp,
+                            stop_loss_price: sl,
+                        });
                     }
                 }
             }
@@ -525,28 +570,29 @@ impl AerisEngineNode {
             if !self.paper_positions.contains_key(&key) {
                 let mids = self.recent_mids.get(&(book.venue, book.symbol)).cloned().unwrap_or_default();
                 if let Some(intent) = self.breakout_engine.evaluate(book, &mids, now_ns) {
-                    if self.risk_gateway.evaluate_order(&intent, &self.account, Some(intent.price)).is_ok() {
+                    let pass_macro = match (intent.side, macro_bias) {
+                        (Side::Sell, 1) => false,
+                        (Side::Buy, 2) => false,
+                        _ => true,
+                    };
+
+                    if pass_macro && self.risk_gateway.evaluate_order(&intent, &self.account, Some(intent.price)).is_ok() {
                         let (tp, sl) = match intent.side {
                             Side::Buy => (
-                                intent.price * Fixed8::from_f64(1.00025),
-                                intent.price * Fixed8::from_f64(0.99985),
+                                intent.price * Fixed8::from_f64(1.00050),
+                                intent.price * Fixed8::from_f64(0.99970),
                             ),
                             Side::Sell => (
-                                intent.price * Fixed8::from_f64(0.99975),
-                                intent.price * Fixed8::from_f64(1.00015),
+                                intent.price * Fixed8::from_f64(0.99950),
+                                intent.price * Fixed8::from_f64(1.00030),
                             ),
                         };
-                        self.apply_strategy_fill(
-                            StrategyId::AggressiveBreakout,
-                            &intent,
-                            intent.price,
-                            intent.qty,
-                            false,
-                            tp,
-                            sl,
-                            now_ns,
-                        );
-                        executed_intents.push(intent);
+                        candidates.push(StrategyCandidate {
+                            strategy: StrategyId::AggressiveBreakout,
+                            intent,
+                            take_profit_price: tp,
+                            stop_loss_price: sl,
+                        });
                     }
                 }
             }
@@ -560,31 +606,149 @@ impl AerisEngineNode {
                 if mids.len() >= 3 {
                     let mean: Fixed8 = mids.iter().fold(Fixed8::ZERO, |acc, m| acc + *m) / Fixed8::from_f64(mids.len() as f64);
                     if let Some(intent) = self.counter_punch_engine.evaluate(book, mean, now_ns) {
-                        if self.risk_gateway.evaluate_order(&intent, &self.account, Some(intent.price)).is_ok() {
+                        // Do not fade strong trend expansions
+                        let pass_macro = match (intent.side, macro_bias) {
+                            (Side::Sell, 1) => false, // Don't short into supply squeeze
+                            (Side::Buy, 2) => false,  // Don't catch falling knives in distribution
+                            _ => true,
+                        };
+
+                        if pass_macro && self.risk_gateway.evaluate_order(&intent, &self.account, Some(intent.price)).is_ok() {
                             let (tp, sl) = match intent.side {
                                 Side::Buy => (
-                                    intent.price * Fixed8::from_f64(1.00020),
-                                    intent.price * Fixed8::from_f64(0.99985),
+                                    intent.price * Fixed8::from_f64(1.00040),
+                                    intent.price * Fixed8::from_f64(0.99975),
                                 ),
                                 Side::Sell => (
-                                    intent.price * Fixed8::from_f64(0.99980),
-                                    intent.price * Fixed8::from_f64(1.00015),
+                                    intent.price * Fixed8::from_f64(0.99960),
+                                    intent.price * Fixed8::from_f64(1.00025),
                                 ),
                             };
-                            self.apply_strategy_fill(
-                                StrategyId::CounterPunch,
-                                &intent,
-                                intent.price,
-                                intent.qty,
-                                false,
-                                tp,
-                                sl,
-                                now_ns,
-                            );
-                            executed_intents.push(intent);
+                            candidates.push(StrategyCandidate {
+                                strategy: StrategyId::CounterPunch,
+                                intent,
+                                take_profit_price: tp,
+                                stop_loss_price: sl,
+                            });
                         }
                     }
                 }
+            }
+        }
+
+        // =====================================================================
+        // 7. INTERNAL CROSSING (DARK NETTING) EXECUTION ENGINE
+        // =====================================================================
+        let mut grouped: HashMap<(Venue, Symbol), (Vec<StrategyCandidate>, Vec<StrategyCandidate>)> = HashMap::new();
+        for c in candidates {
+            let entry = grouped.entry((c.intent.venue, c.intent.symbol)).or_insert_with(|| (Vec::new(), Vec::new()));
+            match c.intent.side {
+                Side::Buy => entry.0.push(c),
+                Side::Sell => entry.1.push(c),
+            }
+        }
+
+        for ((venue, sym), (mut buys, mut sells)) in grouped {
+            let mid_px = self.books.get(&(venue, sym)).and_then(|b| b.mid_price());
+
+            // Match opposing internal buy and sell orders at mid-price
+            while !buys.is_empty() && !sells.is_empty() {
+                let mut buy_cand = buys.pop().unwrap();
+                let mut sell_cand = sells.pop().unwrap();
+
+                let match_qty = buy_cand.intent.qty.min(sell_cand.intent.qty);
+                let cross_px = mid_px.unwrap_or(buy_cand.intent.price);
+
+                let notional = cross_px * match_qty;
+                // Roundtrip taker fee saved (5 bps + 5 bps = 10 bps)
+                let fees_saved = (notional * Fixed8::from_f64(10.0)) / Fixed8::from_f64(10000.0);
+                self.total_fees_saved = self.total_fees_saved + fees_saved;
+                self.total_internal_crosses += 1;
+
+                let m_buy = self.strategy_metrics.entry(buy_cand.strategy).or_default();
+                m_buy.fees_saved = m_buy.fees_saved + (fees_saved / Fixed8::from_f64(2.0));
+                let m_sell = self.strategy_metrics.entry(sell_cand.strategy).or_default();
+                m_sell.fees_saved = m_sell.fees_saved + (fees_saved / Fixed8::from_f64(2.0));
+
+                println!(
+                    "  [DARK POOL NETTING] 🔥 MATCHED {:.4} {:?} {} @ ${:.2}! [{}] (Buy) <-> [{}] (Sell) | Exchange Fees Saved: +${:.4}",
+                    match_qty.to_f64(),
+                    venue,
+                    sym.as_str(),
+                    cross_px.to_f64(),
+                    buy_cand.strategy.name(),
+                    sell_cand.strategy.name(),
+                    fees_saved.to_f64()
+                );
+
+                // Internal zero-fee execution for Buy
+                self.apply_strategy_fill(
+                    buy_cand.strategy,
+                    &buy_cand.intent,
+                    cross_px,
+                    match_qty,
+                    false,
+                    true, // is_internal_cross = true (ZERO FEE)
+                    buy_cand.take_profit_price,
+                    buy_cand.stop_loss_price,
+                    now_ns,
+                );
+                executed_intents.push(buy_cand.intent);
+
+                // Internal zero-fee execution for Sell
+                self.apply_strategy_fill(
+                    sell_cand.strategy,
+                    &sell_cand.intent,
+                    cross_px,
+                    match_qty,
+                    false,
+                    true, // is_internal_cross = true (ZERO FEE)
+                    sell_cand.take_profit_price,
+                    sell_cand.stop_loss_price,
+                    now_ns,
+                );
+                executed_intents.push(sell_cand.intent);
+
+                // Handle residuals
+                if buy_cand.intent.qty > match_qty {
+                    buy_cand.intent.qty = buy_cand.intent.qty - match_qty;
+                    buys.push(buy_cand);
+                } else if sell_cand.intent.qty > match_qty {
+                    sell_cand.intent.qty = sell_cand.intent.qty - match_qty;
+                    sells.push(sell_cand);
+                }
+            }
+
+            // Route uncrossed buy residuals to exchange
+            for rem_buy in buys {
+                self.apply_strategy_fill(
+                    rem_buy.strategy,
+                    &rem_buy.intent,
+                    rem_buy.intent.price,
+                    rem_buy.intent.qty,
+                    false,
+                    false,
+                    rem_buy.take_profit_price,
+                    rem_buy.stop_loss_price,
+                    now_ns,
+                );
+                executed_intents.push(rem_buy.intent);
+            }
+
+            // Route uncrossed sell residuals to exchange
+            for rem_sell in sells {
+                self.apply_strategy_fill(
+                    rem_sell.strategy,
+                    &rem_sell.intent,
+                    rem_sell.intent.price,
+                    rem_sell.intent.qty,
+                    false,
+                    false,
+                    rem_sell.take_profit_price,
+                    rem_sell.stop_loss_price,
+                    now_ns,
+                );
+                executed_intents.push(rem_sell.intent);
             }
         }
 
@@ -622,14 +786,14 @@ impl AerisEngineNode {
             self.total_tds_paid.to_f64()
         );
         println!(
-            " Macro Bias: {} | IPC Seq: {} | Spreads Executed: {} | Total Fills: {}",
+            " Macro Bias: {} | Dark Crosses: {} | Fees Saved: +${:.4} | Fills: {}",
             match self.active_macro.macro_bias {
                 1 => "SUPPLY_SQUEEZE (Bullish)",
                 2 => "DISTRIBUTION (Bearish)",
-                _ => "NEUTRAL / QUIET",
+                _ => "NEUTRAL / CHOP",
             },
-            self.last_macro_seq,
-            self.total_spreads_executed,
+            self.total_internal_crosses,
+            self.total_fees_saved.to_f64(),
             self.total_fills_count
         );
 
@@ -705,8 +869,8 @@ impl AerisEngineNode {
         println!("--------------------------------------------------------------------------------");
         println!("                   AERIS MULTI-STRATEGY SHOWDOWN LEADERBOARD                    ");
         println!("--------------------------------------------------------------------------------");
-        println!(" Rank | Strategy           | Status   | Trades | Win%  | Gross PnL | Fees/TDS | Net Alpha ");
-        println!("------+--------------------+----------+--------+-------+-----------+----------+-----------");
+        println!(" Rank | Strategy           | Status   | Trades | Win%  | Crosses | Saved Fees | Net Alpha ");
+        println!("------+--------------------+----------+--------+-------+---------+------------+-----------");
 
         for (idx, (st, m, _u_pnl, net_alpha, win_rate)) in leaderboard_data.iter().enumerate() {
             let rank_str = format!("#{}", idx + 1);
@@ -719,14 +883,14 @@ impl AerisEngineNode {
             };
 
             println!(
-                " {:4} | {:18} | {:8} | {:6} | {:4.1}% | ${:+.4} | ${:7.4} | ${:+.4} ",
+                " {:4} | {:18} | {:8} | {:6} | {:4.1}% | {:7} | +${:9.4} | ${:+.4} ",
                 rank_str,
                 st.name(),
                 status_str,
                 m.closed_trades,
                 win_rate,
-                m.gross_realized_pnl.to_f64(),
-                (m.fees_paid + m.tds_paid).to_f64(),
+                m.internal_crosses_count,
+                m.fees_saved.to_f64(),
                 net_alpha.to_f64()
             );
         }
@@ -734,11 +898,11 @@ impl AerisEngineNode {
         let best = &leaderboard_data[0];
         println!("--------------------------------------------------------------------------------");
         println!(
-            " 🏆 STRONGEST STRATEGY: {} (Net Alpha: ${:+.4} | Win Rate: {:.1}% | Closed: {})",
+            " 🏆 STRONGEST STRATEGY: {} (Net Alpha: ${:+.4} | Win Rate: {:.1}% | Saved Fees: +${:.4})",
             best.0.name(),
             best.3.to_f64(),
             best.4,
-            best.1.closed_trades
+            best.1.fees_saved.to_f64()
         );
         println!("================================================================================\n");
     }
@@ -752,6 +916,7 @@ async fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     let is_live = args.iter().any(|a| a == "--live");
+    let is_onshore = args.iter().any(|a| a == "--onshore");
     let max_ticks: Option<u64> = args
         .iter()
         .position(|a| a == "--ticks")
@@ -767,7 +932,6 @@ async fn main() {
         r.store(false, Ordering::SeqCst);
     });
 
-    let is_onshore = args.iter().any(|a| a == "--onshore");
     let mut node = AerisEngineNode::new(
         Fixed8::from_f64(100_000.0),
         is_onshore,
