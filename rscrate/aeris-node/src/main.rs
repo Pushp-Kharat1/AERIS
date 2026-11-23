@@ -917,11 +917,18 @@ async fn main() {
     let args: Vec<String> = std::env::args().collect();
     let is_live = args.iter().any(|a| a == "--live");
     let is_onshore = args.iter().any(|a| a == "--onshore");
+    let duration_mins: Option<u64> = args
+        .iter()
+        .position(|a| a == "--duration-mins")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse().ok());
+
     let max_ticks: Option<u64> = args
         .iter()
         .position(|a| a == "--ticks")
         .and_then(|i| args.get(i + 1))
-        .and_then(|v| v.parse().ok());
+        .and_then(|v| v.parse().ok())
+        .or_else(|| duration_mins.map(|m| m * 120));
 
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -1010,8 +1017,10 @@ async fn main() {
                 }
                 _ = interval.tick() => {
                     node.execute_cycle();
-                    node.print_status();
                     ticks += 1;
+                    if ticks % 10 == 0 || (max_ticks.is_some() && ticks >= max_ticks.unwrap()) {
+                        node.print_status();
+                    }
                     if let Some(limit) = max_ticks {
                         if ticks >= limit {
                             break;
@@ -1089,5 +1098,9 @@ async fn main() {
         }
     }
 
+    println!("\n================================================================================");
+    println!("             FINAL MULTI-STRATEGY SOAK BENCHMARK REPORT                         ");
+    println!("================================================================================");
+    node.print_status();
     println!("[INFO] Node execution completed cleanly.");
 }
