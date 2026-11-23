@@ -55,7 +55,7 @@ impl SyntheticMarketGenerator {
             timestamp_ns: self.current_time_ns,
             bids,
             asks,
-            is_snapshot: false,
+            is_snapshot: true,
         })
     }
 

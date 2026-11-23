@@ -205,7 +205,7 @@ mod tests {
         sim.process_event(trade, t1);
 
         let pos = sim.positions.get(&sym).unwrap();
-        // With 2.5 bps adverse selection, effective entry price is penalised downwards from limit price
-        assert!(pos.avg_entry_price < bid_px, "Adverse selection penalty must shift effective entry price!");
+        // With 2.5 bps adverse selection, effective entry price is penalised upwards (higher cost) from limit price
+        assert!(pos.avg_entry_price > bid_px, "Adverse selection penalty must shift effective entry price!");
     }
 }

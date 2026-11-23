@@ -143,20 +143,17 @@ impl FeeAndFillSimulator {
         }
     }
 
-    fn process_trade_against_queue(&mut self, trade: &TradePrint, now_ns: TimestampNs) {
-        let queue_fills = self.queue.on_trade_print(trade.price, trade.qty, now_ns);
+    fn process_trade_against_queue(&mut self, _trade: &TradePrint, now_ns: TimestampNs) {
+        let queue_fills = self.queue.on_trade_print(_trade.price, _trade.qty, now_ns);
 
-        for (_id, qty, price) in queue_fills {
-            // Determine side based on which side of the book was filled
-            let is_buy_maker = trade.is_buyer_maker; // If true, trade was aggressive sell into our resting bid
-            let side = if is_buy_maker { Side::Buy } else { Side::Sell };
-
+        for (_id, side, qty, price) in queue_fills {
             // Apply adverse selection penalty if market moved aggressively through our price
-            let effective_price = if side == Side::Buy {
-                // If we bought resting, aggressive selling pushes mark down
-                price - (price * self.config.adverse_selection_bps / Fixed8::from_int(10000))
-            } else {
-                price + (price * self.config.adverse_selection_bps / Fixed8::from_int(10000))
+            // Maker Buy gets pushed to a worse (higher) effective entry cost
+            // Maker Sell gets pushed to a worse (lower) effective exit receipt
+            let adverse_drift = price * self.config.adverse_selection_bps / Fixed8::from_int(10000);
+            let effective_price = match side {
+                Side::Buy => price + adverse_drift,
+                Side::Sell => price - adverse_drift,
             };
 
             self.execute_fill(side, effective_price, qty, true, now_ns);

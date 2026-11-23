@@ -71,13 +71,13 @@ impl SimulatedOrderQueue {
     }
 
     /// Process a trade print against active resting orders in the queue
-    /// Returns vector of (client_order_id, filled_qty, fill_price)
+    /// Returns vector of (client_order_id, side, filled_qty, fill_price)
     pub fn on_trade_print(
         &mut self,
         trade_price: Fixed8,
         trade_qty: Fixed8,
         now_ns: TimestampNs,
-    ) -> Vec<(u64, Fixed8, Fixed8)> {
+    ) -> Vec<(u64, Side, Fixed8, Fixed8)> {
         let mut fills = Vec::new();
 
         self.resting_orders.retain_mut(|order| {
@@ -105,7 +105,7 @@ impl SimulatedOrderQueue {
                     order.remaining_qty = order.remaining_qty - fill_qty;
                     order.queue_ahead = Fixed8::ZERO;
 
-                    fills.push((order.client_order_id, fill_qty, order.price));
+                    fills.push((order.client_order_id, order.side, fill_qty, order.price));
 
                     // Keep in queue only if partially filled
                     order.remaining_qty.is_positive()
