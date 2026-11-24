@@ -195,7 +195,18 @@ impl AerisEngineNode {
             Fixed8::from_f64(0.05),
         );
 
-        let shm = shm_path.and_then(|p| PingPongSharedMemory::create_or_open(p).ok());
+        let shm = shm_path.and_then(|p| {
+            match PingPongSharedMemory::create_or_open(&p) {
+                Ok(s) => {
+                    println!("[IPC] 🔗 Successfully connected to Shared Memory at: {:?}", p);
+                    Some(s)
+                }
+                Err(e) => {
+                    eprintln!("[IPC ERROR] ❌ Failed to open Shared Memory at {:?}: {:?}", p, e);
+                    None
+                }
+            }
+        });
 
         Self {
             initial_equity,
@@ -237,12 +248,40 @@ impl AerisEngineNode {
         }
     }
 
-    pub fn poll_ipc(&mut self) -> bool {
+    pub fn poll_ipc(&mut self, now_ns: TimestampNs) -> bool {
         if let Some(ref shm) = self.shm {
             let (seq, payload) = shm.read_active();
+
+            // Stale watchdog guard: if payload timestamp is older than 10 seconds (10,000,000,000 ns)
+            // or if updated_at_ns is 0 (uninitialized), treat as stale!
+            let age_ns = now_ns.saturating_sub(payload.updated_at_ns);
+            let is_stale = payload.updated_at_ns == 0 || age_ns > 10_000_000_000;
+
+            if is_stale {
+                if self.active_macro.macro_bias != 0 {
+                    eprintln!(
+                        "  [DEADMAN WARN] ⚠️ MPM SHM payload is STALE (age: {:.1}s > 10.0s)! Degraded to NEUTRAL / CHOP.",
+                        age_ns as f64 / 1_000_000_000.0
+                    );
+                }
+                self.active_macro.macro_bias = 0; // Degrade to NEUTRAL / CHOP for safety!
+                return false;
+            }
+
             if seq > self.last_macro_seq {
                 self.last_macro_seq = seq;
                 self.active_macro = payload;
+                println!(
+                    "  [IPC UPDATE] 📡 Received fresh MPM regime seq #{}: Bias = {} ({}) | Lev Cap = {:.2}x",
+                    seq,
+                    payload.macro_bias,
+                    match payload.macro_bias {
+                        1 => "SUPPLY_SQUEEZE (Bullish)",
+                        2 => "DISTRIBUTION (Bearish)",
+                        _ => "NEUTRAL / CHOP",
+                    },
+                    payload.leverage_cap_fixed8.to_f64()
+                );
                 return true;
             }
         }
@@ -505,7 +544,7 @@ impl AerisEngineNode {
         self.cycle_count += 1;
         let now_ns = current_time_ns();
 
-        self.poll_ipc();
+        self.poll_ipc(now_ns);
 
         // 1. Evaluate open position exits (Take-Profit / Stop-Loss / Timeout)
         self.evaluate_position_exits(now_ns);
@@ -1228,6 +1267,8 @@ async fn main() {
     let shm_primary = PathBuf::from("D:/Pushp - Do not open without permission/AERIS/Python Playground/data/aeris_shm.dat");
     let shm_fallback = PathBuf::from("D:/Pushp - Do not open without permission/AERIS/data/aeris_shm.dat");
     let shm_path = if shm_primary.exists() {
+        Some(shm_primary)
+    } else if let Ok(_) = std::fs::create_dir_all(shm_primary.parent().unwrap()) {
         Some(shm_primary)
     } else {
         Some(shm_fallback)
