@@ -85,6 +85,8 @@ pub struct StrategyPosition {
     pub take_profit_price: Fixed8,
     pub stop_loss_price: Fixed8,
     pub entry_cycle: u64,
+    pub entry_fee: Fixed8,
+    pub entry_tds: Fixed8,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -97,7 +99,9 @@ pub struct StrategyMetrics {
     pub fees_saved: Fixed8,
     pub gross_realized_pnl: Fixed8,
     pub fees_paid: Fixed8,
+    pub closed_fees_paid: Fixed8,
     pub tds_paid: Fixed8,
+    pub closed_tds_paid: Fixed8,
     pub net_realized_pnl: Fixed8,
 }
 
@@ -171,7 +175,7 @@ impl AerisEngineNode {
             Fixed8::from_f64(0.05),
         );
         let calib_momentum_engine = MicroMomentumEngine::new(
-            Fixed8::from_f64(0.035), // 0.035 bps divergence threshold (Calibrated)
+            Fixed8::from_f64(0.12),  // 0.12 bps divergence threshold (Calibrated Stoikov)
             Fixed8::from_f64(0.05),
         );
         let raw_breakout_engine = AggressiveBreakoutEngine::new(
@@ -287,6 +291,8 @@ impl AerisEngineNode {
                 pos.avg_entry_price = pos.total_notional / pos.qty;
                 pos.take_profit_price = take_profit_price;
                 pos.stop_loss_price = stop_loss_price;
+                pos.entry_fee = pos.entry_fee + fee_paid;
+                pos.entry_tds = pos.entry_tds + tds_paid;
             }
         } else {
             self.paper_positions.insert(
@@ -303,6 +309,8 @@ impl AerisEngineNode {
                     take_profit_price,
                     stop_loss_price,
                     entry_cycle: self.cycle_count,
+                    entry_fee: fee_paid,
+                    entry_tds: tds_paid,
                 },
             );
         }
@@ -392,20 +400,25 @@ impl AerisEngineNode {
             };
 
             let notional = exit_price * pos.qty;
-            let is_maker_exit = pos.strategy.is_calibrated() && reason == "TAKE-PROFIT";
-            let fees = self.friction.compute_fee(notional, is_maker_exit);
-            let tds = self.friction.compute_tds(notional, exit_side);
+            // Calibrated: Passive maker for Take-Profit and Time-Decay; Hard aggressive taker for Stop-Loss!
+            let is_maker_exit = pos.strategy.is_calibrated() && (reason == "TAKE-PROFIT" || reason == "TIME-DECAY");
+            let exit_fees = self.friction.compute_fee(notional, is_maker_exit);
+            let exit_tds = self.friction.compute_tds(notional, exit_side);
 
             let gross_pnl = match pos.side {
                 Side::Buy => (exit_price - pos.avg_entry_price) * pos.qty,
                 Side::Sell => (pos.avg_entry_price - exit_price) * pos.qty,
             };
 
-            let net_pnl = gross_pnl - fees - tds;
+            let roundtrip_fees = pos.entry_fee + exit_fees;
+            let roundtrip_tds = pos.entry_tds + exit_tds;
+            let net_pnl = gross_pnl - roundtrip_fees - roundtrip_tds;
+
             self.realized_pnl = self.realized_pnl + gross_pnl;
-            self.account.total_equity = self.account.total_equity + net_pnl;
-            self.total_fees_paid = self.total_fees_paid + fees;
-            self.total_tds_paid = self.total_tds_paid + tds;
+            // account.total_equity already had pos.entry_fee debited at entry; now apply gross_pnl - exit_fees - exit_tds
+            self.account.total_equity = self.account.total_equity + gross_pnl - exit_fees - exit_tds;
+            self.total_fees_paid = self.total_fees_paid + exit_fees;
+            self.total_tds_paid = self.total_tds_paid + exit_tds;
 
             let m = self.strategy_metrics.entry(pos.strategy).or_default();
             m.closed_trades += 1;
@@ -416,12 +429,14 @@ impl AerisEngineNode {
                 m.winning_trades += 1;
             }
             m.gross_realized_pnl = m.gross_realized_pnl + gross_pnl;
-            m.fees_paid = m.fees_paid + fees;
-            m.tds_paid = m.tds_paid + tds;
+            m.fees_paid = m.fees_paid + exit_fees;
+            m.closed_fees_paid = m.closed_fees_paid + roundtrip_fees;
+            m.tds_paid = m.tds_paid + exit_tds;
+            m.closed_tds_paid = m.closed_tds_paid + roundtrip_tds;
             m.net_realized_pnl = m.net_realized_pnl + net_pnl;
 
             println!(
-                "  [STRATEGY EXIT] 🎯 {:?} triggered {} on {:?} {} | Entry: ${:.2} -> Exit: ${:.2} | Gross: ${:+.4} | Net: ${:+.4}",
+                "  [STRATEGY EXIT] 🎯 {:?} triggered {} on {:?} {} | Entry: ${:.2} -> Exit: ${:.2} | Gross: ${:+.4} | Fees: -${:.4} | Net: ${:+.4}",
                 pos.strategy,
                 reason,
                 pos.venue,
@@ -429,6 +444,7 @@ impl AerisEngineNode {
                 pos.avg_entry_price.to_f64(),
                 exit_price.to_f64(),
                 gross_pnl.to_f64(),
+                roundtrip_fees.to_f64(),
                 net_pnl.to_f64()
             );
         }
@@ -627,7 +643,7 @@ impl AerisEngineNode {
             }
         }
 
-        // 4b. Strategy: Stoikov Micro-Divergence (Calibrated Fleet - 15s Debounce, 7x Hurdle, 3:1 R:R)
+        // 4b. Strategy: Stoikov Micro-Divergence (Calibrated Fleet - 15s Debounce, 24x Hurdle 0.12 bps, 1.5x Depth Skew, 3:1 R:R)
         for book in &books_snapshot {
             let key = (StrategyId::StoikovCalibrated, book.venue, book.symbol);
             let last_entry = self.last_entry_time_ns.get(&key).copied().unwrap_or(0);
@@ -641,7 +657,15 @@ impl AerisEngineNode {
                         _ => true,
                     };
 
-                    if pass_macro && self.risk_gateway.evaluate_order(&intent, &self.account, Some(intent.price)).is_ok() {
+                    // Order flow depth confirmation: require 1.5x depth on intent side
+                    let bid_depth: Fixed8 = book.bids().iter().take(5).fold(Fixed8::ZERO, |acc, b| acc + b.qty);
+                    let ask_depth: Fixed8 = book.asks().iter().take(5).fold(Fixed8::ZERO, |acc, a| acc + a.qty);
+                    let has_depth_confirm = match intent.side {
+                        Side::Buy => bid_depth >= ask_depth * Fixed8::from_f64(1.5),
+                        Side::Sell => ask_depth >= bid_depth * Fixed8::from_f64(1.5),
+                    };
+
+                    if pass_macro && has_depth_confirm && self.risk_gateway.evaluate_order(&intent, &self.account, Some(intent.price)).is_ok() {
                         let (tp, sl) = match intent.side {
                             Side::Buy => (
                                 intent.price * Fixed8::from_f64(1.00150),
@@ -1070,17 +1094,17 @@ impl AerisEngineNode {
 
         leaderboard_data.sort_by(|a, b| b.3.cmp(&a.3));
 
-        println!("------------------------------------------------------------------------------------------------------");
-        println!("                         AERIS MULTI-STRATEGY SHOWDOWN LEADERBOARD (UNBIASED MTM)                      ");
-        println!("------------------------------------------------------------------------------------------------------");
-        println!(" Rank | Strategy           | Cohort     | Trades | Gross W% | Net W%  | Gross PnL | Fees Paid | Net Alpha ");
-        println!("------+--------------------+------------+--------+----------+---------+-----------+-----------+-----------");
+        println!("-----------------------------------------------------------------------------------------------------------------------------");
+        println!("                         AERIS MULTI-STRATEGY SHOWDOWN LEADERBOARD (UNBIASED DOUBLE-ENTRY MTM)                               ");
+        println!("-----------------------------------------------------------------------------------------------------------------------------");
+        println!(" Rank | Strategy           | Cohort     | Trades | Gross W% | Net W%  | Gross Realized | Closed Fees | Net Realized | Open MTM  | Total Alpha ");
+        println!("------+--------------------+------------+--------+----------+---------+----------------+-------------+--------------+-----------+-------------");
 
-        for (idx, (st, m, _u_pnl, net_alpha, net_win_rate, gross_win_rate)) in leaderboard_data.iter().enumerate() {
+        for (idx, (st, m, u_pnl, net_alpha, net_win_rate, gross_win_rate)) in leaderboard_data.iter().enumerate() {
             let rank_str = format!("#{}", idx + 1);
 
             println!(
-                " {:4} | {:18} | {:10} | {:6} | {:7.1}% | {:6.1}% | ${:+9.2} | -${:8.2} | ${:+.4} ",
+                " {:4} | {:18} | {:10} | {:6} | {:7.1}% | {:6.1}% | ${:+13.2} | -${:10.2} | ${:+11.2} | ${:+8.2} | ${:+.4} ",
                 rank_str,
                 st.name(),
                 st.cohort(),
@@ -1088,17 +1112,19 @@ impl AerisEngineNode {
                 gross_win_rate,
                 net_win_rate,
                 m.gross_realized_pnl.to_f64(),
-                m.fees_paid.to_f64(),
+                m.closed_fees_paid.to_f64(),
+                m.net_realized_pnl.to_f64(),
+                u_pnl.to_f64(),
                 net_alpha.to_f64()
             );
         }
 
         // COHORT AGGREGATE SUMMARY TABLE
-        println!("------------------------------------------------------------------------------------------------------");
-        println!("                         COHORT HEAD-TO-HEAD SHOWDOWN: OLD CHAPS vs CALIBRATED FLEET                  ");
-        println!("------------------------------------------------------------------------------------------------------");
-        println!(" Cohort     | Trades | Gross W% | Net W%  | Gross PnL   | Fees Paid   | Net Alpha   | Fee/Alpha Ratio   ");
-        println!("------------+--------+----------+---------+-------------+-------------+-------------+-------------------");
+        println!("-----------------------------------------------------------------------------------------------------------------------------");
+        println!("                         COHORT HEAD-TO-HEAD SHOWDOWN: OLD CHAPS vs CALIBRATED FLEET (RECONCILED)                            ");
+        println!("-----------------------------------------------------------------------------------------------------------------------------");
+        println!(" Cohort     | Trades | Gross W% | Net W%  | Gross Realized | Closed Fees | Net Realized | Open MTM  | Total Alpha | Fee/Alpha Ratio   ");
+        println!("------------+--------+----------+---------+----------------+-------------+--------------+-----------+-------------+-------------------");
 
         let cohorts = ["OLD CHAPS", "CALIBRATED", "ARBITRAGE"];
         for cohort_name in &cohorts {
@@ -1106,16 +1132,20 @@ impl AerisEngineNode {
             let mut c_gross_wins: u64 = 0;
             let mut c_net_wins: u64 = 0;
             let mut c_gross_pnl = Fixed8::ZERO;
-            let mut c_fees = Fixed8::ZERO;
+            let mut c_closed_fees = Fixed8::ZERO;
+            let mut c_net_realized = Fixed8::ZERO;
+            let mut c_u_pnl = Fixed8::ZERO;
             let mut c_net_alpha = Fixed8::ZERO;
 
-            for (st, m, _u_pnl, net_alpha, _, _) in &leaderboard_data {
+            for (st, m, u_pnl, net_alpha, _, _) in &leaderboard_data {
                 if st.cohort() == *cohort_name {
                     c_trades += m.closed_trades;
                     c_gross_wins += m.gross_winning_trades;
                     c_net_wins += m.winning_trades;
                     c_gross_pnl = c_gross_pnl + m.gross_realized_pnl;
-                    c_fees = c_fees + m.fees_paid;
+                    c_closed_fees = c_closed_fees + m.closed_fees_paid;
+                    c_net_realized = c_net_realized + m.net_realized_pnl;
+                    c_u_pnl = c_u_pnl + *u_pnl;
                     c_net_alpha = c_net_alpha + *net_alpha;
                 }
             }
@@ -1123,26 +1153,28 @@ impl AerisEngineNode {
             let c_gross_wr = if c_trades > 0 { (c_gross_wins as f64 / c_trades as f64) * 100.0 } else { 0.0 };
             let c_net_wr = if c_trades > 0 { (c_net_wins as f64 / c_trades as f64) * 100.0 } else { 0.0 };
             let fee_ratio_str = if c_gross_pnl.to_f64().abs() > 0.001 {
-                let ratio = c_fees.to_f64() / c_gross_pnl.to_f64().abs();
+                let ratio = c_closed_fees.to_f64() / c_gross_pnl.to_f64().abs();
                 if ratio > 1.0 {
                     format!("{:6.1}x (BURN)", ratio)
                 } else {
                     format!("{:6.2}x (EDGE)", ratio)
                 }
-            } else if c_fees.is_positive() {
+            } else if c_closed_fees.is_positive() {
                 "  INFx (BURN)".to_string()
             } else {
                 "  0.00x (FLAT)".to_string()
             };
 
             println!(
-                " {:10} | {:6} | {:7.1}% | {:6.1}% | ${:+10.2} | -${:10.2} | ${:+10.2} | {:17}",
+                " {:10} | {:6} | {:7.1}% | {:6.1}% | ${:+13.2} | -${:10.2} | ${:+11.2} | ${:+8.2} | ${:+10.2} | {:17}",
                 cohort_name,
                 c_trades,
                 c_gross_wr,
                 c_net_wr,
                 c_gross_pnl.to_f64(),
-                c_fees.to_f64(),
+                c_closed_fees.to_f64(),
+                c_net_realized.to_f64(),
+                c_u_pnl.to_f64(),
                 c_net_alpha.to_f64(),
                 fee_ratio_str
             );
