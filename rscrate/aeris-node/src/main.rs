@@ -1225,10 +1225,18 @@ async fn main() {
         r.store(false, Ordering::SeqCst);
     });
 
+    let shm_primary = PathBuf::from("D:/Pushp - Do not open without permission/AERIS/Python Playground/data/aeris_shm.dat");
+    let shm_fallback = PathBuf::from("D:/Pushp - Do not open without permission/AERIS/data/aeris_shm.dat");
+    let shm_path = if shm_primary.exists() {
+        Some(shm_primary)
+    } else {
+        Some(shm_fallback)
+    };
+
     let mut node = AerisEngineNode::new(
         Fixed8::from_f64(100_000.0),
         is_onshore,
-        Some(PathBuf::from("D:/Pushp - Do not open without permission/AERIS/data/aeris_shm.dat")),
+        shm_path,
     );
 
     let gd_target = "127.0.0.1:9876";
