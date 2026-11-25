@@ -96,18 +96,30 @@ pub async fn connect_bybit_depth(
         .send(tokio_tungstenite::tungstenite::Message::Text(sub_msg))
         .await?;
 
-    while let Some(msg) = read.next().await {
-        match msg {
-            Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
-                if let Ok(Some(update)) = parse_bybit_depth(&text, symbol) {
-                    if tx.send(update).await.is_err() {
-                        break;
-                    }
+    let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(20));
+
+    loop {
+        tokio::select! {
+            _ = ping_interval.tick() => {
+                let ping_msg = serde_json::json!({"op": "ping"}).to_string();
+                if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Text(ping_msg)).await {
+                    return Err(BybitWsError::ConnectionError(e));
                 }
             }
-            Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => break,
-            Err(e) => return Err(BybitWsError::ConnectionError(e)),
-            _ => {}
+            maybe_msg = read.next() => {
+                match maybe_msg {
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                        if let Ok(Some(update)) = parse_bybit_depth(&text, symbol) {
+                            if tx.send(update).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None => break,
+                    Some(Err(e)) => return Err(BybitWsError::ConnectionError(e)),
+                    _ => {}
+                }
+            }
         }
     }
 

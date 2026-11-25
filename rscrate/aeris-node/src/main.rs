@@ -147,6 +147,7 @@ pub struct AerisEngineNode {
     pub is_onshore: bool,
     pub cycle_count: u64,
     pub last_entry_time_ns: HashMap<(StrategyId, Venue, Symbol), TimestampNs>,
+    pub last_book_update_ns: HashMap<(Venue, Symbol), TimestampNs>,
 }
 
 impl AerisEngineNode {
@@ -245,6 +246,7 @@ impl AerisEngineNode {
             is_onshore,
             cycle_count: 0,
             last_entry_time_ns: HashMap::new(),
+            last_book_update_ns: HashMap::new(),
         }
     }
 
@@ -386,45 +388,60 @@ impl AerisEngineNode {
 
     pub fn evaluate_position_exits(&mut self, _now_ns: TimestampNs) {
         let mut exits = Vec::new();
+        let cycle_count = self.cycle_count;
 
-        for (key, pos) in &self.paper_positions {
+        for (key, pos) in &mut self.paper_positions {
             if let Some(book) = self.books.get(&(pos.venue, pos.symbol)) {
-                match pos.side {
-                    Side::Buy => {
-                        if let Some(bid) = book.best_bid() {
-                            let is_tp = bid.price >= pos.take_profit_price;
-                            let is_sl = bid.price <= pos.stop_loss_price;
-                            let timeout_cycles = if pos.strategy.is_calibrated() { 60 } else { 16 };
-                            let is_timeout = (self.cycle_count.saturating_sub(pos.entry_cycle)) >= timeout_cycles;
-                            if is_tp || is_sl || is_timeout {
-                                let reason = if is_tp {
-                                    "TAKE-PROFIT"
-                                } else if is_sl {
-                                    "STOP-LOSS"
-                                } else {
-                                    "TIME-DECAY"
-                                };
-                                exits.push((*key, pos.clone(), bid.price, reason));
+                let exit_px = match pos.side {
+                    Side::Buy => book.best_bid().map(|b| b.price),
+                    Side::Sell => book.best_ask().map(|a| a.price),
+                };
+
+                if let Some(px) = exit_px {
+                    // Option 2: Trailing Breakeven for BreakoutCalibrated at +10 bps -> ratchet SL to entry + 3 bps
+                    if pos.strategy == StrategyId::BreakoutCalibrated {
+                        match pos.side {
+                            Side::Buy => {
+                                let be_trigger = pos.avg_entry_price * Fixed8::from_f64(1.00100);
+                                let be_stop = pos.avg_entry_price * Fixed8::from_f64(1.00030);
+                                if px >= be_trigger && pos.stop_loss_price < be_stop {
+                                    pos.stop_loss_price = be_stop;
+                                    println!(
+                                        "  [TRAILING BE] 🛡️ BreakoutCalibrated armed +3 bps breakeven SL on {:?} {} @ ${:.2} (Bid: ${:.2})",
+                                        pos.venue, pos.symbol.as_str(), be_stop.to_f64(), px.to_f64()
+                                    );
+                                }
+                            }
+                            Side::Sell => {
+                                let be_trigger = pos.avg_entry_price * Fixed8::from_f64(0.99900);
+                                let be_stop = pos.avg_entry_price * Fixed8::from_f64(0.99970);
+                                if px <= be_trigger && pos.stop_loss_price > be_stop {
+                                    pos.stop_loss_price = be_stop;
+                                    println!(
+                                        "  [TRAILING BE] 🛡️ BreakoutCalibrated armed +3 bps breakeven SL on {:?} {} @ ${:.2} (Ask: ${:.2})",
+                                        pos.venue, pos.symbol.as_str(), be_stop.to_f64(), px.to_f64()
+                                    );
+                                }
                             }
                         }
                     }
-                    Side::Sell => {
-                        if let Some(ask) = book.best_ask() {
-                            let is_tp = ask.price <= pos.take_profit_price;
-                            let is_sl = ask.price >= pos.stop_loss_price;
-                            let timeout_cycles = if pos.strategy.is_calibrated() { 60 } else { 16 };
-                            let is_timeout = (self.cycle_count.saturating_sub(pos.entry_cycle)) >= timeout_cycles;
-                            if is_tp || is_sl || is_timeout {
-                                let reason = if is_tp {
-                                    "TAKE-PROFIT"
-                                } else if is_sl {
-                                    "STOP-LOSS"
-                                } else {
-                                    "TIME-DECAY"
-                                };
-                                exits.push((*key, pos.clone(), ask.price, reason));
-                            }
-                        }
+
+                    let (is_tp, is_sl) = match pos.side {
+                        Side::Buy => (px >= pos.take_profit_price, px <= pos.stop_loss_price),
+                        Side::Sell => (px <= pos.take_profit_price, px >= pos.stop_loss_price),
+                    };
+                    let timeout_cycles = if pos.strategy.is_calibrated() { 60 } else { 16 };
+                    let is_timeout = (cycle_count.saturating_sub(pos.entry_cycle)) >= timeout_cycles;
+
+                    if is_tp || is_sl || is_timeout {
+                        let reason = if is_tp {
+                            "TAKE-PROFIT"
+                        } else if is_sl {
+                            "STOP-LOSS"
+                        } else {
+                            "TIME-DECAY"
+                        };
+                        exits.push((*key, pos.clone(), px, reason));
                     }
                 }
             }
@@ -524,6 +541,7 @@ impl AerisEngineNode {
     pub fn on_book_update(&mut self, update: &BookUpdate) {
         let now_ns = current_time_ns();
         self.deadman.record_heartbeat(update.venue, now_ns);
+        self.last_book_update_ns.insert((update.venue, update.symbol), now_ns);
 
         let book = self
             .books
@@ -578,11 +596,13 @@ impl AerisEngineNode {
             executed_intents.push(unwind);
         }
 
-        // 3. Strategy: Cross-Venue Net Spread Arbitrage Scanner
+        // 3. Strategy: Cross-Venue Net Spread Arbitrage Scanner (Fresh books only < 3s)
         let unique_symbols: HashSet<Symbol> = self.books.keys().map(|(_, sym)| *sym).collect();
         for sym in unique_symbols {
-            let binance_book = self.books.get(&(Venue::Binance, sym)).cloned();
-            let bybit_book = self.books.get(&(Venue::Bybit, sym)).cloned();
+            let b_fresh = self.last_book_update_ns.get(&(Venue::Binance, sym)).map_or(false, |&t| now_ns.saturating_sub(t) < 3_000_000_000);
+            let by_fresh = self.last_book_update_ns.get(&(Venue::Bybit, sym)).map_or(false, |&t| now_ns.saturating_sub(t) < 3_000_000_000);
+            let binance_book = if b_fresh { self.books.get(&(Venue::Binance, sym)).cloned() } else { None };
+            let bybit_book = if by_fresh { self.books.get(&(Venue::Bybit, sym)).cloned() } else { None };
 
             if let (Some(b_book), Some(by_book)) = (binance_book, bybit_book) {
                 if let Some(opp) = self.arb_engine.inspect_spread(sym, &b_book, &by_book) {
@@ -645,9 +665,19 @@ impl AerisEngineNode {
         }
 
         // Collect Candidate Orders for Directional / Microstructure Strategies (Dual-Cohort Showdown)
+        // Deadman Guard: Only evaluate books updated within the last 3 seconds (prevents trading on frozen feeds)
         let mut candidates: Vec<StrategyCandidate> = Vec::new();
         let macro_bias = self.active_macro.macro_bias;
-        let books_snapshot: Vec<aeris_feed::L2OrderBook> = self.books.values().cloned().collect();
+        let books_snapshot: Vec<aeris_feed::L2OrderBook> = self
+            .books
+            .iter()
+            .filter(|(k, _)| {
+                self.last_book_update_ns
+                    .get(k)
+                    .map_or(false, |&t| now_ns.saturating_sub(t) < 3_000_000_000)
+            })
+            .map(|(_, b)| b.clone())
+            .collect();
 
         // 4a. Strategy: Stoikov Micro-Divergence (Old Chap - Raw)
         for book in &books_snapshot {
@@ -760,7 +790,7 @@ impl AerisEngineNode {
             }
         }
 
-        // 5b. Strategy: Aggressive Breakout (Calibrated Fleet - 15s Debounce, 5x Hurdle, 2.67:1 R:R)
+        // 5b. Strategy: Aggressive Breakout (Calibrated Fleet - 15s Debounce, 5x Hurdle, 4:1 R:R, 24 bps TP, +10 bps Trailing BE)
         for book in &books_snapshot {
             let key = (StrategyId::BreakoutCalibrated, book.venue, book.symbol);
             let last_entry = self.last_entry_time_ns.get(&key).copied().unwrap_or(0);
@@ -778,11 +808,11 @@ impl AerisEngineNode {
                     if pass_macro && self.risk_gateway.evaluate_order(&intent, &self.account, Some(intent.price)).is_ok() {
                         let (tp, sl) = match intent.side {
                             Side::Buy => (
-                                intent.price * Fixed8::from_f64(1.00160),
+                                intent.price * Fixed8::from_f64(1.00240),
                                 intent.price * Fixed8::from_f64(0.99940),
                             ),
                             Side::Sell => (
-                                intent.price * Fixed8::from_f64(0.99840),
+                                intent.price * Fixed8::from_f64(0.99760),
                                 intent.price * Fixed8::from_f64(1.00060),
                             ),
                         };
