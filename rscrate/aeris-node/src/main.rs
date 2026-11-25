@@ -28,6 +28,23 @@ fn current_time_ns() -> TimestampNs {
         .as_nanos() as u64
 }
 
+/// Kaufman Efficiency Ratio over recent mid prices: |net move| / sum(|step moves|) in [0.0, 1.0].
+fn compute_efficiency_ratio(mids: &[Fixed8]) -> f64 {
+    if mids.len() < 6 {
+        return 0.0;
+    }
+    let net_move = (mids[mids.len() - 1].to_f64() - mids[0].to_f64()).abs();
+    let total_path: f64 = mids
+        .windows(2)
+        .map(|w| (w[1].to_f64() - w[0].to_f64()).abs())
+        .sum();
+    if total_path <= 1e-12 {
+        0.0
+    } else {
+        (net_move / total_path).min(1.0)
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum StrategyId {
     StoikovRaw,
@@ -185,7 +202,7 @@ impl AerisEngineNode {
             Fixed8::from_f64(0.05),
         );
         let calib_breakout_engine = AggressiveBreakoutEngine::new(
-            Fixed8::from_f64(1.5),   // 1.5 bps breakout threshold (Calibrated)
+            Fixed8::from_f64(5.0),   // 5.0 bps breakout threshold (Calibrated - strong 10s impulse only)
             Fixed8::from_f64(0.05),
         );
         let raw_counter_punch_engine = CounterPunchEngine::new(
@@ -193,7 +210,7 @@ impl AerisEngineNode {
             Fixed8::from_f64(0.05),
         );
         let calib_counter_punch_engine = CounterPunchEngine::new(
-            Fixed8::from_f64(1.0),   // 1.0 bps stretch threshold (Calibrated)
+            Fixed8::from_f64(4.5),   // 4.5 bps stretch threshold (Calibrated - high-conviction wicks only)
             Fixed8::from_f64(0.05),
         );
 
@@ -550,19 +567,24 @@ impl AerisEngineNode {
             .entry((update.venue, update.symbol))
             .or_insert_with(|| L2OrderBook::new(update.venue, update.symbol));
         book.apply_update(update);
-
-        if let Some(mid) = book.mid_price() {
-            let hist = self.recent_mids.entry((update.venue, update.symbol)).or_default();
-            hist.push(mid);
-            if hist.len() > 20 {
-                hist.remove(0);
-            }
-        }
     }
 
     pub fn execute_cycle(&mut self) -> Vec<OrderIntent> {
         self.cycle_count += 1;
         let now_ns = current_time_ns();
+
+        // Sample mid-prices once per 500ms cycle (20 samples = 10 full seconds) instead of raw WS jitter
+        for (&(venue, sym), book) in &self.books {
+            if self.last_book_update_ns.get(&(venue, sym)).map_or(false, |&t| now_ns.saturating_sub(t) < 3_000_000_000) {
+                if let Some(mid) = book.mid_price() {
+                    let hist = self.recent_mids.entry((venue, sym)).or_default();
+                    hist.push(mid);
+                    if hist.len() > 20 {
+                        hist.remove(0);
+                    }
+                }
+            }
+        }
 
         self.poll_ipc(now_ns);
 
@@ -792,7 +814,7 @@ impl AerisEngineNode {
             }
         }
 
-        // 5b. Strategy: Aggressive Breakout (Calibrated Fleet - 15s Debounce, 5x Hurdle, 4:1 R:R, 24 bps TP, +10 bps Trailing BE)
+        // 5b. Strategy: Aggressive Breakout (Calibrated Fleet - 15s Debounce, ER >= 0.55 Trend Gate, 3.5 bps Hurdle, 24 bps TP, +10 bps Trailing BE)
         for book in &books_snapshot {
             let key = (StrategyId::BreakoutCalibrated, book.venue, book.symbol);
             let last_entry = self.last_entry_time_ns.get(&key).copied().unwrap_or(0);
@@ -800,7 +822,9 @@ impl AerisEngineNode {
 
             if is_debounced && !self.paper_positions.contains_key(&key) {
                 let mids = self.recent_mids.get(&(book.venue, book.symbol)).cloned().unwrap_or_default();
-                if let Some(intent) = self.calib_breakout_engine.evaluate(book, &mids, now_ns) {
+                let er = compute_efficiency_ratio(&mids);
+                if mids.len() >= 6 && er >= 0.55 {
+                    if let Some(intent) = self.calib_breakout_engine.evaluate(book, &mids, now_ns) {
                     let pass_macro = match (intent.side, macro_bias) {
                         (Side::Sell, 1) => false,
                         (Side::Buy, 2) => false,
@@ -824,6 +848,7 @@ impl AerisEngineNode {
                             take_profit_price: tp,
                             stop_loss_price: sl,
                         });
+                    }
                     }
                 }
             }
@@ -866,15 +891,16 @@ impl AerisEngineNode {
             }
         }
 
-        // 6b. Strategy: Counter-Punch Micro-Wick (Calibrated Fleet - 15s Debounce, 3.3x Hurdle, Depth Replenishment, 2.4:1 R:R)
+        // 6b. Strategy: Counter-Punch Micro-Wick (Calibrated Fleet - MPM Active Regime Gate macro_bias != 0, 15s Debounce, ER <= 0.30, 4.5 bps Hurdle, Depth Replenishment)
         for book in &books_snapshot {
             let key = (StrategyId::CounterPunchCalibrated, book.venue, book.symbol);
             let last_entry = self.last_entry_time_ns.get(&key).copied().unwrap_or(0);
             let is_debounced = now_ns.saturating_sub(last_entry) >= 15_000_000_000;
 
-            if is_debounced && !self.paper_positions.contains_key(&key) {
+            if macro_bias != 0 && is_debounced && !self.paper_positions.contains_key(&key) {
                 let mids = self.recent_mids.get(&(book.venue, book.symbol)).cloned().unwrap_or_default();
-                if mids.len() >= 3 {
+                let er = compute_efficiency_ratio(&mids);
+                if mids.len() >= 6 && er <= 0.30 {
                     let mean: Fixed8 = mids.iter().fold(Fixed8::ZERO, |acc, m| acc + *m) / Fixed8::from_f64(mids.len() as f64);
                     if let Some(intent) = self.calib_counter_punch_engine.evaluate(book, mean, now_ns) {
                         let pass_macro = match (intent.side, macro_bias) {
@@ -894,12 +920,12 @@ impl AerisEngineNode {
                         if pass_macro && has_replenishment && self.risk_gateway.evaluate_order(&intent, &self.account, Some(intent.price)).is_ok() {
                             let (tp, sl) = match intent.side {
                                 Side::Buy => (
-                                    intent.price * Fixed8::from_f64(1.00120),
-                                    intent.price * Fixed8::from_f64(0.99950),
+                                    intent.price * Fixed8::from_f64(1.00200),
+                                    intent.price * Fixed8::from_f64(0.99940),
                                 ),
                                 Side::Sell => (
-                                    intent.price * Fixed8::from_f64(0.99880),
-                                    intent.price * Fixed8::from_f64(1.00050),
+                                    intent.price * Fixed8::from_f64(0.99800),
+                                    intent.price * Fixed8::from_f64(1.00060),
                                 ),
                             };
                             candidates.push(StrategyCandidate {
