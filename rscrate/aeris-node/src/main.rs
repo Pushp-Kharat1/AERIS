@@ -148,6 +148,7 @@ pub struct AerisEngineNode {
     pub cycle_count: u64,
     pub last_entry_time_ns: HashMap<(StrategyId, Venue, Symbol), TimestampNs>,
     pub last_book_update_ns: HashMap<(Venue, Symbol), TimestampNs>,
+    pub pending_netting_buffer: Vec<(StrategyCandidate, TimestampNs)>,
 }
 
 impl AerisEngineNode {
@@ -247,6 +248,7 @@ impl AerisEngineNode {
             cycle_count: 0,
             last_entry_time_ns: HashMap::new(),
             last_book_update_ns: HashMap::new(),
+            pending_netting_buffer: Vec::new(),
         }
     }
 
@@ -913,24 +915,40 @@ impl AerisEngineNode {
         }
 
         // =====================================================================
-        // 7. INTERNAL CROSSING (DARK NETTING) EXECUTION ENGINE
+        // 7. INTERNAL CROSSING (DARK NETTING + 500ms NON-URGENT BUFFER)
         // =====================================================================
-        let mut grouped: HashMap<(Venue, Symbol), (Vec<StrategyCandidate>, Vec<StrategyCandidate>)> = HashMap::new();
+        // Merge previously buffered non-urgent candidates with new candidates, avoiding duplicates.
+        let mut all_pool: Vec<(StrategyCandidate, TimestampNs)> = std::mem::take(&mut self.pending_netting_buffer);
         for c in candidates {
-            let entry = grouped.entry((c.intent.venue, c.intent.symbol)).or_insert_with(|| (Vec::new(), Vec::new()));
-            match c.intent.side {
-                Side::Buy => entry.0.push(c),
-                Side::Sell => entry.1.push(c),
+            let already_buffered = all_pool.iter().any(|(existing, _)| {
+                existing.strategy == c.strategy
+                    && existing.intent.venue == c.intent.venue
+                    && existing.intent.symbol == c.intent.symbol
+            });
+            if !already_buffered {
+                all_pool.push((c, now_ns));
             }
         }
 
-        for ((venue, sym), (mut buys, mut sells)) in grouped {
+        // Group by (is_calibrated, Venue, Symbol) to preserve strict A/B cohort isolation
+        let mut grouped: HashMap<(bool, Venue, Symbol), (Vec<(StrategyCandidate, TimestampNs)>, Vec<(StrategyCandidate, TimestampNs)>)> = HashMap::new();
+        for (c, ts) in all_pool {
+            let entry = grouped
+                .entry((c.strategy.is_calibrated(), c.intent.venue, c.intent.symbol))
+                .or_insert_with(|| (Vec::new(), Vec::new()));
+            match c.intent.side {
+                Side::Buy => entry.0.push((c, ts)),
+                Side::Sell => entry.1.push((c, ts)),
+            }
+        }
+
+        for ((_is_calib, venue, sym), (mut buys, mut sells)) in grouped {
             let mid_px = self.books.get(&(venue, sym)).and_then(|b| b.mid_price());
 
             // Match opposing internal buy and sell orders at mid-price
             while !buys.is_empty() && !sells.is_empty() {
-                let mut buy_cand = buys.pop().unwrap();
-                let mut sell_cand = sells.pop().unwrap();
+                let (mut buy_cand, buy_ts) = buys.pop().unwrap();
+                let (mut sell_cand, sell_ts) = sells.pop().unwrap();
 
                 let match_qty = buy_cand.intent.qty.min(sell_cand.intent.qty);
                 let cross_px = mid_px.unwrap_or(buy_cand.intent.price);
@@ -988,45 +1006,39 @@ impl AerisEngineNode {
                 // Handle residuals
                 if buy_cand.intent.qty > match_qty {
                     buy_cand.intent.qty = buy_cand.intent.qty - match_qty;
-                    buys.push(buy_cand);
+                    buys.push((buy_cand, buy_ts));
                 } else if sell_cand.intent.qty > match_qty {
                     sell_cand.intent.qty = sell_cand.intent.qty - match_qty;
-                    sells.push(sell_cand);
+                    sells.push((sell_cand, sell_ts));
                 }
             }
 
-            // Route uncrossed buy residuals to exchange
-            for rem_buy in buys {
-                let is_maker = rem_buy.strategy.is_calibrated();
-                self.apply_strategy_fill(
-                    rem_buy.strategy,
-                    &rem_buy.intent,
-                    rem_buy.intent.price,
-                    rem_buy.intent.qty,
-                    is_maker,
-                    false,
-                    rem_buy.take_profit_price,
-                    rem_buy.stop_loss_price,
-                    now_ns,
+            // Route uncrossed residuals: hold non-urgent CounterPunchCalib / StoikovCalib up to 500ms;
+            // route Breakout* and expired buffered orders immediately.
+            for (rem, enqueued_ts) in buys.into_iter().chain(sells.into_iter()) {
+                let is_non_urgent = matches!(
+                    rem.strategy,
+                    StrategyId::StoikovCalibrated | StrategyId::CounterPunchCalibrated
                 );
-                executed_intents.push(rem_buy.intent);
-            }
+                let age_ns = now_ns.saturating_sub(enqueued_ts);
 
-            // Route uncrossed sell residuals to exchange
-            for rem_sell in sells {
-                let is_maker = rem_sell.strategy.is_calibrated();
-                self.apply_strategy_fill(
-                    rem_sell.strategy,
-                    &rem_sell.intent,
-                    rem_sell.intent.price,
-                    rem_sell.intent.qty,
-                    is_maker,
-                    false,
-                    rem_sell.take_profit_price,
-                    rem_sell.stop_loss_price,
-                    now_ns,
-                );
-                executed_intents.push(rem_sell.intent);
+                if is_non_urgent && age_ns < 450_000_000 {
+                    self.pending_netting_buffer.push((rem, enqueued_ts));
+                } else {
+                    let is_maker = rem.strategy.is_calibrated();
+                    self.apply_strategy_fill(
+                        rem.strategy,
+                        &rem.intent,
+                        rem.intent.price,
+                        rem.intent.qty,
+                        is_maker,
+                        false,
+                        rem.take_profit_price,
+                        rem.stop_loss_price,
+                        now_ns,
+                    );
+                    executed_intents.push(rem.intent);
+                }
             }
         }
 
